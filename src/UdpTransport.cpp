@@ -1,5 +1,3 @@
-// Copyright (c) 2025 Baidu.com, Inc. All Rights Reserved
-
 #include "UdpTransport.h"
 #include <sys/socket.h>
 #include <netinet/in.h>

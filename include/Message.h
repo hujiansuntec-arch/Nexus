@@ -1,5 +1,3 @@
-// Copyright (c) 2025 Baidu.com, Inc. All Rights Reserved
-
 #pragma once
 
 #include <stdint.h>

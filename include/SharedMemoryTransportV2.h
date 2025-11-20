@@ -1,7 +1,5 @@
 // Lock-Free Shared Memory Transport v2
 // Uses SPSC queues for each sender-receiver pair
-// Copyright (c) 2025 Baidu.com, Inc. All Rights Reserved
-
 #pragma once
 
 #include "LockFreeQueue.h"

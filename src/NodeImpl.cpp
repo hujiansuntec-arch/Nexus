@@ -1,5 +1,3 @@
-// Copyright (c) 2025 Baidu.com, Inc. All Rights Reserved
-
 #include "NodeImpl.h"
 #include "UdpTransport.h"
 #include "SharedMemoryTransportV2.h"

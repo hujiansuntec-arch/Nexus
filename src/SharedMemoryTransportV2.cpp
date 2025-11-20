@@ -1,6 +1,4 @@
 // Lock-Free Shared Memory Transport v2 Implementation
-// Copyright (c) 2025 Baidu.com, Inc. All Rights Reserved
-
 #include "SharedMemoryTransportV2.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
