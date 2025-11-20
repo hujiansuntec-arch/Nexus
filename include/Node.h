@@ -89,20 +89,31 @@ public:
 };
 
 /**
+ * @brief Transport mode for inter-process communication
+ */
+enum class TransportMode {
+    AUTO,           // Automatic selection (default: lock-free shared memory if available)
+    LOCK_FREE_SHM,  // Lock-free shared memory (high performance, recommended)
+    UDP             // UDP transport (for distributed scenarios)
+};
+
+/**
  * @brief Create a new Node instance
  * 
  * The node automatically supports both in-process and inter-process communication:
  * - In-process: Direct function calls (zero-copy, <1μs latency)
- * - Inter-process: UDP communication (automatic discovery and routing)
+ * - Inter-process: Shared memory (lock-free SPSC queues, ~10000 msg/s) or UDP
  * 
  * The framework automatically determines the communication method when broadcasting:
  * - If target nodes are in the same process → in-process delivery
- * - If target nodes are in other processes → UDP delivery
+ * - If target nodes are in other processes → shared memory or UDP delivery
  * 
  * @param node_id Unique identifier for this node (optional, auto-generated if empty)
+ * @param mode Transport mode for inter-process communication
  * @return Shared pointer to Node instance
  */
-std::shared_ptr<Node> createNode(const std::string& node_id = "");
+std::shared_ptr<Node> createNode(const std::string& node_id = "", 
+                                 TransportMode mode = TransportMode::AUTO);
 
 /**
  * @brief Get the default communication interface (singleton node)

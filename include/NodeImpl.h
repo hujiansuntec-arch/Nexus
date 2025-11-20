@@ -11,18 +11,24 @@
 #include <atomic>
 #include <thread>
 #include <queue>
+#include <condition_variable>
+#include <vector>
 
 namespace librpc {
 
 // Forward declarations
 class UdpTransport;
+class SharedMemoryTransportV2;
 
 /**
  * @brief Node implementation supporting both in-process and inter-process communication
  */
 class NodeImpl : public Node, public std::enable_shared_from_this<NodeImpl> {
 public:
-    NodeImpl(const std::string& node_id, bool use_udp, uint16_t udp_port);
+    static constexpr size_t NUM_PROCESSING_THREADS = 4;  // Thread pool size (for QueueStats)
+    
+    NodeImpl(const std::string& node_id, bool use_udp, uint16_t udp_port, 
+             TransportMode transport_mode = TransportMode::AUTO);
     ~NodeImpl() override;
 
     // Initialize after construction (must be called after shared_ptr is created)
@@ -45,6 +51,13 @@ public:
 
     bool isSubscribed(const Property& msg_group, 
                      const Property& topic) const override;
+
+    // Performance statistics
+    struct QueueStats {
+        size_t queue_depth[NUM_PROCESSING_THREADS];  // Current depth per thread
+        size_t total_dropped;                         // Total dropped messages
+    };
+    QueueStats getQueueStats() const;
 
     // Internal methods
     std::string getNodeId() const { return node_id_; }
@@ -89,15 +102,30 @@ private:
                          const uint8_t* payload,
                          size_t payload_len);
     
-    // Inter-process delivery via UDP (targeted)
-    void deliverViaUdp(const std::vector<uint8_t>& packet,
-                      const std::string& group,
-                      const std::string& topic);
+    // Inter-process delivery (via shared memory or UDP)
+    void deliverInterProcess(const std::vector<uint8_t>& packet,
+                            const std::string& group,
+                            const std::string& topic);
     
     // Send subscription registration to all nodes
     void broadcastSubscription(const std::string& group,
                               const std::string& topic,
                               bool is_subscribe);
+    
+    // Async message processing
+    struct PendingMessage {
+        std::string source_node_id;
+        std::string group;
+        std::string topic;
+        std::vector<uint8_t> payload;
+    };
+    
+    void messageProcessingThread(size_t thread_id);
+    void enqueueMessage(const std::string& source_node_id,
+                       const std::string& group,
+                       const std::string& topic,
+                       const uint8_t* payload,
+                       size_t payload_len);
     
     // Subscription management
     struct SubscriptionInfo {
@@ -116,6 +144,7 @@ private:
 private:
     std::string node_id_;
     bool use_udp_;
+    TransportMode transport_mode_;
     std::atomic<bool> running_;
     
     // Local subscriptions: group -> SubscriptionInfo
@@ -126,8 +155,17 @@ private:
     mutable std::mutex remote_nodes_mutex_;
     std::map<std::string, RemoteNodeInfo> remote_nodes_;
     
-    // UDP transport (single socket for all communication)
-    std::unique_ptr<UdpTransport> udp_transport_;
+    // Transport layers
+    std::unique_ptr<UdpTransport> udp_transport_;                   // For remote communication
+    std::unique_ptr<SharedMemoryTransportV2> shm_transport_v2_;     // For local communication (lock-free)
+    
+    // Async message processing
+    static constexpr size_t MAX_QUEUE_SIZE = 25000;       // Max messages per queue (increased for high throughput)
+    mutable std::mutex message_queue_mutexes_[NUM_PROCESSING_THREADS];
+    std::condition_variable message_queue_cvs_[NUM_PROCESSING_THREADS];
+    std::queue<PendingMessage> message_queues_[NUM_PROCESSING_THREADS];  // One queue per thread
+    std::vector<std::thread> processing_threads_;
+    std::atomic<size_t> dropped_messages_{0};  // Counter for dropped messages due to queue overflow
     
     // Global registry for in-process communication
     static std::mutex registry_mutex_;
