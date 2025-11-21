@@ -16,7 +16,7 @@ namespace librpc {
 
 // Forward declarations
 class UdpTransport;
-class SharedMemoryTransportV2;
+class SharedMemoryTransportV3;
 
 /**
  * @brief Node implementation supporting both in-process and inter-process communication
@@ -155,7 +155,7 @@ private:
     
     // Transport layers
     std::unique_ptr<UdpTransport> udp_transport_;                   // For remote communication
-    std::unique_ptr<SharedMemoryTransportV2> shm_transport_v2_;     // For local communication (lock-free)
+    std::unique_ptr<SharedMemoryTransportV3> shm_transport_v3_;     // For local communication (dynamic)
     
     // Async message processing
     static constexpr size_t MAX_QUEUE_SIZE = 25000;       // Max messages per queue (increased for high throughput)

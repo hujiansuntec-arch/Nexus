@@ -1,6 +1,6 @@
 #include "NodeImpl.h"
 #include "UdpTransport.h"
-#include "SharedMemoryTransportV2.h"
+#include "SharedMemoryTransportV3.h"
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
@@ -74,14 +74,14 @@ void NodeImpl::initialize(uint16_t udp_port) {
     
     // Initialize lock-free shared memory transport
     if (transport_mode_ == TransportMode::AUTO || transport_mode_ == TransportMode::LOCK_FREE_SHM) {
-        shm_transport_v2_ = std::make_unique<SharedMemoryTransportV2>();
-        if (!shm_transport_v2_->initialize(node_id_)) {
+        shm_transport_v3_ = std::make_unique<SharedMemoryTransportV3>();
+        if (!shm_transport_v3_->initialize(node_id_)) {
             std::cerr << "[LibRPC] Lock-free shared memory initialization failed" << std::endl;
-            shm_transport_v2_.reset();
+            shm_transport_v3_.reset();
         } else {
-            std::cout << "[LibRPC] Using lock-free shared memory transport" << std::endl;
+            std::cout << "[LibRPC] Using lock-free shared memory transport (V3 - Dynamic)" << std::endl;
             // Set receive callback - parse MessagePacket format
-            shm_transport_v2_->setReceiveCallback([this](const uint8_t* data, size_t size, 
+            shm_transport_v3_->setReceiveCallback([this](const uint8_t* data, size_t size, 
                                                          const std::string& from) {
                 // Data should be in MessagePacket format
                 if (size < sizeof(MessagePacket)) {
@@ -130,12 +130,12 @@ void NodeImpl::initialize(uint16_t udp_port) {
                         break;
                 }
             });
-            shm_transport_v2_->startReceiving();
+            shm_transport_v3_->startReceiving();
             
             // Query existing nodes for their subscriptions
             auto query_packet = MessageBuilder::build(node_id_, "", "", "", 
                                                      getUdpPort(), MessageType::QUERY_SUBSCRIPTIONS);
-            shm_transport_v2_->broadcast(query_packet.data(), query_packet.size());
+            shm_transport_v3_->broadcast(query_packet.data(), query_packet.size());
         }
     }
     
@@ -436,9 +436,9 @@ void NodeImpl::deliverInterProcess(const std::vector<uint8_t>& packet,
     
     // Build a set of shared memory nodes (local inter-process nodes)
     std::set<std::string> shm_node_ids;
-    if (shm_transport_v2_ && shm_transport_v2_->isInitialized()) {
+    if (shm_transport_v3_ && shm_transport_v3_->isInitialized()) {
         // Lock-free transport: query active nodes
-        auto shm_nodes = shm_transport_v2_->getLocalNodes();
+        auto shm_nodes = shm_transport_v3_->getLocalNodes();
         shm_node_ids.insert(shm_nodes.begin(), shm_nodes.end());
     }
     
@@ -470,7 +470,7 @@ void NodeImpl::deliverInterProcess(const std::vector<uint8_t>& packet,
     // Note: In-process nodes are already handled by deliverInProcess, so we should
     // only send via shared memory if there are nodes outside current process
     bool has_interprocess_nodes = false;
-    if (shm_transport_v2_ && shm_transport_v2_->isInitialized()) {
+    if (shm_transport_v3_ && shm_transport_v3_->isInitialized()) {
         // Check if there are any nodes in shared memory that are NOT in our process
         for (const auto& shm_node_id : shm_node_ids) {
             if (local_node_ids.count(shm_node_id) == 0) {
@@ -481,7 +481,7 @@ void NodeImpl::deliverInterProcess(const std::vector<uint8_t>& packet,
         
         // Only broadcast via shared memory if there are inter-process nodes
         if (has_interprocess_nodes) {
-            shm_transport_v2_->broadcast(packet.data(), packet.size());
+            shm_transport_v3_->broadcast(packet.data(), packet.size());
         }
     }
     
@@ -506,8 +506,8 @@ void NodeImpl::broadcastSubscription(const std::string& group,
                                        getUdpPort(), msg_type);
     
     // Broadcast via lock-free shared memory to local nodes
-    if (shm_transport_v2_ && shm_transport_v2_->isInitialized()) {
-        shm_transport_v2_->broadcast(packet.data(), packet.size());
+    if (shm_transport_v3_ && shm_transport_v3_->isInitialized()) {
+        shm_transport_v3_->broadcast(packet.data(), packet.size());
     }
     
     // Broadcast via UDP if enabled
@@ -647,9 +647,9 @@ void NodeImpl::handleQuerySubscriptions(const std::string& remote_node_id,
             
             if (is_shm_query) {
                 // Reply via lock-free shared memory
-                if (shm_transport_v2_ && shm_transport_v2_->isInitialized()) {
+                if (shm_transport_v3_ && shm_transport_v3_->isInitialized()) {
                     // For broadcast-based transport, just broadcast the reply
-                    shm_transport_v2_->broadcast(packet.data(), packet.size());
+                    shm_transport_v3_->broadcast(packet.data(), packet.size());
                 }
             } else if (use_udp_) {
                 // Reply via UDP (only if UDP is enabled)
