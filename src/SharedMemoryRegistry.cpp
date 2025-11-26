@@ -4,9 +4,15 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
+#include <cerrno>     // For errno
 #include <chrono>
 #include <signal.h>
 #include <iostream>
+
+// QNX specific includes
+#ifdef __QNXNTO__
+#include <sys/neutrino.h>
+#endif
 
 namespace librpc {
 

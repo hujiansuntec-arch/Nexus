@@ -1,18 +1,29 @@
 #include "SharedMemoryTransportV3.h"
+#include "NodeImpl.h"  // For handleNodeEvent callback
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
+#include <cerrno>     // For errno
 #include <chrono>
 #include <iostream>
 #include <sstream>
 #include <iomanip>
+#include <dirent.h>
+#include <signal.h>   // For kill() process detection
+
+// QNX specific includes
+#ifdef __QNXNTO__
+#include <sys/neutrino.h>
+#include <sys/procfs.h>
+#endif
 
 namespace librpc {
 
 SharedMemoryTransportV3::SharedMemoryTransportV3()
     : initialized_(false)
+    , node_impl_(nullptr)  // Initialize before other members
     , my_shm_ptr_(nullptr)
     , my_shm_fd_(-1)
     , my_shm_(nullptr)
@@ -55,6 +66,14 @@ bool SharedMemoryTransportV3::initialize(const std::string& node_id, const Confi
     
     if (node_id.empty()) {
         std::cerr << "[SHM-V3] Invalid node ID" << std::endl;
+        return false;
+    }
+    
+    // 验证配置
+    if (config.max_inbound_queues > MAX_INBOUND_QUEUES) {
+        std::cerr << "[SHM-V3] Invalid config: max_inbound_queues (" 
+                  << config.max_inbound_queues << ") exceeds limit (" 
+                  << MAX_INBOUND_QUEUES << ")" << std::endl;
         return false;
     }
     
@@ -331,32 +350,120 @@ SharedMemoryTransportV3::TransportStats SharedMemoryTransportV3::getStats() cons
 bool SharedMemoryTransportV3::cleanupOrphanedMemory() {
     std::cout << "[SHM-V3] Cleaning up orphaned shared memory..." << std::endl;
     
-    bool cleaned = false;
+    size_t cleaned_count = 0;
+    size_t total_freed = 0;
     
-    // First, cleanup the registry (this will also tell us about nodes)
-    if (SharedMemoryRegistry::cleanupOrphanedRegistry()) {
-        cleaned = true;
+    // 辅助函数：检查进程是否存活
+    auto isProcessAlive = [](int32_t pid) -> bool {
+        if (pid <= 0) {
+            return false;  // 无效PID
+        }
+        
+        // kill(pid, 0) 不发送信号，只检查进程是否存在
+        if (kill(pid, 0) == 0) {
+            return true;  // 进程存在且有权限访问
+        }
+        
+        // ESRCH: 进程不存在
+        // EPERM: 进程存在但无权限（也算存活）
+        return errno != ESRCH;
+    };
+    
+    // 扫描共享内存目录，查找librpc_node_*文件
+    // QNX uses /dev/shmem instead of /dev/shm
+    #ifdef __QNXNTO__
+    const char* shm_dir = "/dev/shmem";
+    #else
+    const char* shm_dir = "/dev/shm";
+    #endif
+    
+    DIR* dir = opendir(shm_dir);
+    if (!dir) {
+        std::cerr << "[SHM-V3] Failed to open " << shm_dir << ": " << strerror(errno) << std::endl;
+        return false;
     }
     
-    // Try to cleanup individual node shared memories
-    // This is a best-effort approach - we scan for common patterns
-    for (int pid = 1; pid < 65536; ++pid) {
-        for (int hash = 0; hash < 256; ++hash) {
-            char shm_name[128];
-            snprintf(shm_name, sizeof(shm_name), "/librpc_node_%d_%08x", pid, hash);
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+        
+        // 只处理librpc_node_*的共享内存
+        if (name.find("librpc_node_") != 0) {
+            continue;
+        }
+        
+        // 尝试打开共享内存
+        std::string full_name = "/" + name;
+        int fd = shm_open(full_name.c_str(), O_RDWR, 0);
+        if (fd < 0) {
+            continue;
+        }
+        
+        // 获取文件大小
+        struct stat st;
+        if (fstat(fd, &st) != 0) {
+            close(fd);
+            continue;
+        }
+        
+        size_t shm_size = st.st_size;
+        
+        // 映射共享内存以检查header
+        void* addr = mmap(nullptr, sizeof(NodeHeader), PROT_READ, MAP_SHARED, fd, 0);
+        if (addr == MAP_FAILED) {
+            close(fd);
+            continue;
+        }
+        
+        bool should_cleanup = false;
+        std::string cleanup_reason;
+        
+        // 检查是否为有效的V3节点共享内存
+        NodeHeader* header = static_cast<NodeHeader*>(addr);
+        
+        if (header->magic.load(std::memory_order_relaxed) == MAGIC) {
+            // 检查PID是否存活
+            int32_t owner_pid = header->owner_pid.load(std::memory_order_relaxed);
             
-            // Try to unlink (will fail if doesn't exist or in use)
-            if (shm_unlink(shm_name) == 0) {
-                std::cout << "[SHM-V3] Cleaned orphaned memory: " << shm_name << std::endl;
-                cleaned = true;
+            if (owner_pid > 0 && !isProcessAlive(owner_pid)) {
+                should_cleanup = true;
+                cleanup_reason = "owner process dead (PID: " + std::to_string(owner_pid) + ")";
+            }
+        } else {
+            // 不是有效的V3共享内存，可能是残留文件
+            should_cleanup = true;
+            cleanup_reason = "invalid magic number";
+        }
+        
+        munmap(addr, sizeof(NodeHeader));
+        close(fd);
+        
+        if (should_cleanup) {
+            if (shm_unlink(full_name.c_str()) == 0) {
+                cleaned_count++;
+                total_freed += shm_size;
+                std::cout << "[SHM-V3] ✓ Cleaned: " << name 
+                          << " (" << (shm_size / 1024 / 1024) << " MB) - " 
+                          << cleanup_reason << std::endl;
+            } else {
+                std::cerr << "[SHM-V3] ✗ Failed to unlink " << name 
+                          << ": " << strerror(errno) << std::endl;
             }
         }
     }
     
-    if (cleaned) {
-        std::cout << "[SHM-V3] Cleanup complete" << std::endl;
+    closedir(dir);
+    
+    // 清理registry
+    if (SharedMemoryRegistry::cleanupOrphanedRegistry()) {
+        std::cout << "[SHM-V3] ✓ Cleaned orphaned registry" << std::endl;
+    }
+    
+    if (cleaned_count > 0) {
+        std::cout << "[SHM-V3] Cleanup complete: removed " << cleaned_count 
+                  << " node(s), freed " << (total_freed / 1024 / 1024) << " MB" << std::endl;
     } else {
-        std::cout << "[SHM-V3] No orphaned memory found" << std::endl;
+        std::cout << "[SHM-V3] No orphaned nodes found" << std::endl;
     }
     
     return true;
@@ -397,9 +504,15 @@ bool SharedMemoryTransportV3::createMySharedMemory() {
         return false;
     }
     
-    // Map memory with MAP_NORESERVE for lazy physical memory allocation
+    // Map memory
+    // Note: MAP_NORESERVE may not be supported on QNX, use MAP_SHARED only
+    #ifdef __QNXNTO__
+    my_shm_ptr_ = mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, 
+                       MAP_SHARED, my_shm_fd_, 0);
+    #else
     my_shm_ptr_ = mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, 
                        MAP_SHARED | MAP_NORESERVE, my_shm_fd_, 0);
+    #endif
     if (my_shm_ptr_ == MAP_FAILED) {
         std::cerr << "[SHM-V3] Failed to map memory: " << strerror(errno) << std::endl;
         close(my_shm_fd_);
@@ -414,10 +527,11 @@ bool SharedMemoryTransportV3::createMySharedMemory() {
     my_shm_->header.magic.store(MAGIC);
     my_shm_->header.version.store(VERSION);
     my_shm_->header.num_queues.store(0);
-    my_shm_->header.max_queues.store(MAX_INBOUND_QUEUES);
+    my_shm_->header.max_queues.store(config_.max_inbound_queues);  // 使用配置值
     my_shm_->header.last_heartbeat.store(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     my_shm_->header.ready.store(false);  // 🔧 初始为未就绪
+    my_shm_->header.owner_pid.store(getpid(), std::memory_order_release);  // 🔧 记录进程PID
     
     // Initialize all queues
     for (size_t i = 0; i < MAX_INBOUND_QUEUES; ++i) {
@@ -430,7 +544,7 @@ bool SharedMemoryTransportV3::createMySharedMemory() {
     
     size_t mb = shm_size / (1024 * 1024);
     std::cout << "[SHM-V3] Created shared memory: " << my_shm_name_ 
-              << " (" << mb << " MB)" << std::endl;
+              << " (" << mb << " MB, max_queues=" << config_.max_inbound_queues << ")" << std::endl;
     
     return true;
 }
@@ -482,9 +596,15 @@ bool SharedMemoryTransportV3::connectToNode(const std::string& target_node_id) {
         return false;
     }
     
-    // Map remote memory with MAP_NORESERVE for lazy physical memory allocation
+    // Map remote memory
+    // Note: MAP_NORESERVE may not be supported on QNX, use MAP_SHARED only
+    #ifdef __QNXNTO__
+    conn.shm_ptr = mmap(nullptr, sizeof(NodeSharedMemory), PROT_READ | PROT_WRITE, 
+                        MAP_SHARED, conn.shm_fd, 0);
+    #else
     conn.shm_ptr = mmap(nullptr, sizeof(NodeSharedMemory), PROT_READ | PROT_WRITE, 
                         MAP_SHARED | MAP_NORESERVE, conn.shm_fd, 0);
+    #endif
     if (conn.shm_ptr == MAP_FAILED) {
         std::cerr << "[SHM-V3] Failed to map remote shm: " << strerror(errno) << std::endl;
         close(conn.shm_fd);
@@ -562,8 +682,9 @@ SharedMemoryTransportV3::InboundQueue* SharedMemoryTransportV3::findOrCreateQueu
     }
     
     // Not found, create new queue
-    if (num_queues >= MAX_INBOUND_QUEUES) {
-        std::cerr << "[SHM-V3] Remote node queue limit reached" << std::endl;
+    uint32_t max_queues = remote_shm->header.max_queues.load();
+    if (num_queues >= max_queues) {
+        std::cerr << "[SHM-V3] Remote node queue limit reached (" << max_queues << ")" << std::endl;
         return nullptr;
     }
     
@@ -657,8 +778,43 @@ void SharedMemoryTransportV3::heartbeatLoop() {
             my_shm_->header.last_heartbeat.store(ms.count());
         }
         
+        // Get nodes before cleanup (for detecting removed nodes)
+        std::vector<NodeInfo> nodes_before;
+        if (node_impl_) {
+            nodes_before = registry_.getAllNodes();
+        }
+        
         // Clean up stale nodes from registry
-        registry_.cleanupStaleNodes(NODE_TIMEOUT_MS);
+        int cleaned = registry_.cleanupStaleNodes(NODE_TIMEOUT_MS);
+        
+        // Notify NodeImpl about removed nodes (trigger NODE_LEFT events)
+        if (cleaned > 0 && node_impl_) {
+            auto nodes_after = registry_.getAllNodes();
+            
+            // Find which nodes were removed
+            for (const auto& node : nodes_before) {
+                // Skip self
+                if (node.node_id == node_id_) {
+                    continue;
+                }
+                
+                // Check if node still exists
+                bool found = false;
+                for (const auto& n : nodes_after) {
+                    if (n.node_id == node.node_id) {
+                        found = true;
+                        break;
+                    }
+                }
+                
+                // Node was removed - trigger NODE_LEFT event
+                if (!found) {
+                    std::cout << "[SHM-V3] Heartbeat timeout detected for node: " 
+                              << node.node_id << ", triggering NODE_LEFT event" << std::endl;
+                    node_impl_->handleNodeEvent(node.node_id, false);
+                }
+            }
+        }
         
         // Clean up stale inbound queues
         cleanupStaleQueues();

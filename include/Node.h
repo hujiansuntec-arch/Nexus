@@ -8,14 +8,86 @@
 
 namespace librpc {
 
+// Forward declaration
+class LargeDataChannel;
+
+/**
+ * @brief Service type enumeration
+ */
+enum class ServiceType {
+    ALL = 0,           // All service types (for query)
+    NORMAL_MESSAGE,    // Normal pub/sub messages (256B-2KB)
+    LARGE_DATA         // Large data channel (1MB-8MB)
+};
+
+/**
+ * @brief Service descriptor
+ */
+struct ServiceDescriptor {
+    std::string node_id;        // Node providing this service
+    std::string group;          // Message group
+    std::string topic;          // Topic name
+    ServiceType type;           // Service type
+    std::string channel_name;   // Large data channel name (empty for normal messages)
+    
+    // Get unique capability identifier
+    std::string getCapability() const {
+        if (type == ServiceType::LARGE_DATA) {
+            return group + "/" + channel_name + "/" + topic;
+        } else {
+            return group + "/" + topic;
+        }
+    }
+};
+
+/**
+ * @brief Service event type
+ */
+enum class ServiceEvent {
+    SERVICE_ADDED,      // New service registered
+    SERVICE_REMOVED,    // Service unregistered
+    NODE_JOINED,        // New node joined
+    NODE_LEFT           // Node left
+};
+
+/**
+ * @brief Service discovery callback
+ * Called when service changes are detected
+ * @param event Service event type
+ * @param service Service descriptor
+ */
+using ServiceDiscoveryCallback = std::function<void(ServiceEvent event, 
+                                                     const ServiceDescriptor& service)>;
+
+/**
+ * @brief Message queue overflow policy (for normal pub/sub messages)
+ */
+enum class QueueOverflowPolicy {
+    DROP_OLDEST,    // Drop oldest message (default, suitable for sensor data)
+    DROP_NEWEST,    // Drop newest message (suitable for control commands)
+    BLOCK           // Block until space available (may cause deadlock)
+};
+
+/**
+ * @brief Message queue overflow callback (for normal pub/sub messages)
+ * Called when queue is full and a message is dropped
+ * @param msg_group Message group
+ * @param topic Topic name
+ * @param dropped_count Total dropped messages so far
+ */
+using QueueOverflowCallback = std::function<void(const std::string& msg_group,
+                                                   const std::string& topic,
+                                                   size_t dropped_count)>;
+
 /**
  * @brief Node interface for peer-to-peer communication
  * 
  * Features:
  * - Subscribe to topics within message groups
- * - Broadcast messages to subscribers
+ * - Publish messages to subscribers
  * - Support both in-process and inter-process communication
  * - Multiple nodes can coexist in the same process
+ * - Large data transfer channel (for high-frequency big data transmission)
  */
 class Node {
 public:
@@ -33,19 +105,20 @@ public:
         NOT_FOUND        = 4,
         NETWORK_ERROR    = 5,
         TIMEOUT          = 6,
+        QUEUE_FULL       = 7,
         UNEXPECTED_ERROR = 99,
     };
 
     virtual ~Node() = default;
 
     /**
-     * @brief Broadcast a message to all subscribers of a topic
+     * @brief Publish a message to all subscribers of a topic
      * @param msg_group Message group name
      * @param topic Topic name within the group
      * @param payload Message payload data
      * @return Error code
      */
-    virtual Error broadcast(const Property& msg_group, 
+    virtual Error publish(const Property& msg_group, 
                           const Property& topic, 
                           const Property& payload) = 0;
 
@@ -84,6 +157,90 @@ public:
      */
     virtual bool isSubscribed(const Property& msg_group, 
                              const Property& topic) const = 0;
+    
+    /**
+     * @brief Send large data with simplified API
+     * 
+     * This is a high-level API that handles all the details:
+     * - Automatically creates/manages the channel
+     * - Writes data to the ring buffer
+     * - Sends notification to subscribers
+     * - Automatic cleanup when no longer needed
+     * 
+     * Large data channel features:
+     * - Zero-copy shared memory ring buffer
+     * - High throughput (~135 MB/s for 1MB blocks)
+     * - Support for data up to 8MB per block
+     * - Automatic memory management (MAP_NORESERVE)
+     * - Auto-cleanup on process exit (引用计数)
+     * - Startup cleanup for orphaned channels
+     * 
+     * Usage:
+     *   node->sendLargeData("sensor", "video_channel", "frame_001", data, size);
+     * 
+     * @param msg_group Message group for notification (subscribers should subscribe to this group)
+     * @param channel_name Name of the large data channel (internal identifier)
+     * @param topic Topic name for this data
+     * @param data Pointer to data buffer
+     * @param size Size of data in bytes (up to 8MB)
+     * @return NO_ERROR on success, TIMEOUT if buffer full, error code otherwise
+     */
+    virtual Error sendLargeData(const std::string& msg_group,
+                               const std::string& channel_name,
+                               const std::string& topic,
+                               const uint8_t* data,
+                               size_t size) = 0;
+    
+    /**
+     * @brief Set message queue overflow policy (for normal pub/sub messages)
+     * @param policy Overflow policy (default: DROP_OLDEST)
+     */
+    virtual void setQueueOverflowPolicy(QueueOverflowPolicy policy) = 0;
+    
+    /**
+     * @brief Set message queue overflow callback (for normal pub/sub messages)
+     * @param callback Callback function to be called when queue is full
+     */
+    virtual void setQueueOverflowCallback(QueueOverflowCallback callback) = 0;
+    
+    /**
+     * @brief Cleanup orphaned shared memory channels
+     * Should be called periodically or at startup
+     * @return Number of cleaned channels
+     */
+    virtual size_t cleanupOrphanedChannels() = 0;
+    
+    /**
+     * @brief Discover services in the network
+     * @param group Message group to filter (empty for all)
+     * @param type Service type to filter (ALL for all types)
+     * @return Vector of service descriptors
+     */
+    virtual std::vector<ServiceDescriptor> discoverServices(
+        const std::string& group = "",
+        ServiceType type = ServiceType::ALL) = 0;
+    
+    /**
+     * @brief Find nodes providing a specific capability
+     * @param capability Capability string (e.g., "sensor/temperature")
+     * @return Vector of node IDs
+     */
+    virtual std::vector<std::string> findNodesByCapability(
+        const std::string& capability) = 0;
+    
+    /**
+     * @brief Find large data channels
+     * @param group Message group to filter (empty for all)
+     * @return Vector of large data service descriptors
+     */
+    virtual std::vector<ServiceDescriptor> findLargeDataChannels(
+        const std::string& group = "") = 0;
+    
+    /**
+     * @brief Set service discovery callback
+     * @param callback Callback to be invoked on service changes
+     */
+    virtual void setServiceDiscoveryCallback(ServiceDiscoveryCallback callback) = 0;
 };
 
 /**
@@ -102,7 +259,7 @@ enum class TransportMode {
  * - In-process: Direct function calls (zero-copy, <1μs latency)
  * - Inter-process: Shared memory (lock-free SPSC queues, ~10000 msg/s) or UDP
  * 
- * The framework automatically determines the communication method when broadcasting:
+ * The framework automatically determines the communication method when publishing:
  * - If target nodes are in the same process → in-process delivery
  * - If target nodes are in other processes → shared memory or UDP delivery
  * 

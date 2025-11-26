@@ -16,6 +16,9 @@
 
 namespace librpc {
 
+// Forward declaration
+class NodeImpl;
+
 /**
  * @brief Dynamic lock-free shared memory transport
  * 
@@ -36,16 +39,18 @@ public:
     using ReceiveCallback = std::function<void(const uint8_t* data, size_t size,
                                               const std::string& from_node_id)>;
     
-    static constexpr size_t QUEUE_CAPACITY = 1024;
-    static constexpr size_t MAX_INBOUND_QUEUES = 256;  // Max senders to this node
+    static constexpr size_t QUEUE_CAPACITY = 256;
+    static constexpr size_t MAX_INBOUND_QUEUES = 64;  // Max senders to this node (absolute limit, 降低到64)
     
     struct Config {
         size_t queue_capacity;
+        size_t max_inbound_queues;  // 可配置的队列数上限（不能超过MAX_INBOUND_QUEUES）
         bool enable_stats;
         bool auto_cleanup;
         
         Config() 
             : queue_capacity(QUEUE_CAPACITY)
+            , max_inbound_queues(32)  // 默认32（进一步降低内存占用）
             , enable_stats(true)
             , auto_cleanup(true)
         {}
@@ -103,6 +108,12 @@ public:
      * @brief Check if initialized
      */
     bool isInitialized() const { return initialized_; }
+    
+    /**
+     * @brief Set NodeImpl pointer for heartbeat timeout notifications
+     * @param node_impl Pointer to NodeImpl instance
+     */
+    void setNodeImpl(NodeImpl* node_impl) { node_impl_ = node_impl; }
     
     /**
      * @brief Get all local node IDs (nodes using shared memory)
@@ -180,7 +191,8 @@ private:
         std::atomic<uint32_t> max_queues;
         std::atomic<uint64_t> last_heartbeat;
         std::atomic<bool> ready;  // 🔧 两阶段提交：节点是否完全初始化
-        char padding[35];
+        std::atomic<int32_t> owner_pid;  // 🔧 进程PID：用于检测进程是否存活
+        char padding[31];  // 调整padding保持64字节对齐
     };
     
     struct NodeSharedMemory {
@@ -224,6 +236,9 @@ private:
     std::string my_shm_name_;
     Config config_;
     bool initialized_;
+    
+    // NodeImpl reference for heartbeat timeout notifications
+    NodeImpl* node_impl_;
     
     // Registry
     SharedMemoryRegistry registry_;

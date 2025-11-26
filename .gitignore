@@ -1,0 +1,59 @@
+# Build directories
+build/
+lib/
+install/
+.backup/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake
+!cmake/qnx.cmake
+!CMakeLists.txt
+
+# Compiled binaries
+*.o
+*.so
+*.so.*
+*.a
+test_inprocess
+test_duplex_v2
+test_heartbeat_timeout
+test_service_discovery
+test_cross_process_discovery
+test_cross_process_node_events
+test_large_sender
+test_large_receiver
+test_memory_config
+test_queue_limit
+test_optimization
+test_spmc*
+
+# Log files
+*.log
+reader_*.log
+writer.log
+observer.log
+crasher.log
+
+# Shared memory files (runtime)
+/dev/shm/librpc_*
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+*.tmp
+*.bak
+core
+core.*
+
+# Test scripts (generated)
+test_*.sh
+!run_*.sh

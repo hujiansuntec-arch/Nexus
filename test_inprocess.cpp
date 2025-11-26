@@ -60,7 +60,7 @@ void testBasicInProcess() {
     std::cout << "[TEST 3] 广播消息...\n";
     
     // node1广播topic1 -> node1, node2应该收到
-    node1->broadcast("test_group", "topic1", "message1");
+    node1->publish("test_group", "topic1", "message1");
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     std::cout << "  topic1: node1=" << node1_received << ", node2=" << node2_received 
               << ", node3=" << node3_received;
@@ -74,7 +74,7 @@ void testBasicInProcess() {
     node1_received = 0;
     node2_received = 0;
     node3_received = 0;
-    node2->broadcast("test_group", "topic2", "message2");
+    node2->publish("test_group", "topic2", "message2");
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     std::cout << "  topic2: node1=" << node1_received << ", node2=" << node2_received 
               << ", node3=" << node3_received;
@@ -88,7 +88,7 @@ void testBasicInProcess() {
     node1_received = 0;
     node2_received = 0;
     node3_received = 0;
-    node3->broadcast("test_group", "topic3", "message3");
+    node3->publish("test_group", "topic3", "message3");
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     std::cout << "  topic3: node1=" << node1_received << ", node2=" << node2_received 
               << ", node3=" << node3_received;
@@ -135,7 +135,7 @@ void testStressInProcess() {
     
     for (int i = 0; i < num_messages; i++) {
         std::string msg = "message_" + std::to_string(i);
-        node1->broadcast("stress_group", "topic", msg);
+        node1->publish("stress_group", "topic", msg);
     }
     
     auto end = std::chrono::high_resolution_clock::now();

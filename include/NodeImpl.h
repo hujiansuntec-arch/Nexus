@@ -2,6 +2,7 @@
 
 #include "Node.h"
 #include "Message.h"
+#include "LargeDataChannel.h"
 #include <map>
 #include <set>
 #include <mutex>
@@ -22,6 +23,9 @@ class SharedMemoryTransportV3;
  * @brief Node implementation supporting both in-process and inter-process communication
  */
 class NodeImpl : public Node, public std::enable_shared_from_this<NodeImpl> {
+    // Friend class to allow SharedMemoryTransportV3 to call handleNodeEvent
+    friend class SharedMemoryTransportV3;
+    
 public:
     static constexpr size_t NUM_PROCESSING_THREADS = 4;  // Thread pool size (for QueueStats)
     
@@ -33,7 +37,7 @@ public:
     void initialize(uint16_t udp_port);
 
     // Node interface implementation
-    Error broadcast(const Property& msg_group, 
+    Error publish(const Property& msg_group, 
                    const Property& topic, 
                    const Property& payload) override;
 
@@ -49,7 +53,34 @@ public:
 
     bool isSubscribed(const Property& msg_group, 
                      const Property& topic) const override;
-
+    
+    // Large data channel support
+    Error sendLargeData(const std::string& msg_group,
+                       const std::string& channel_name,
+                       const std::string& topic,
+                       const uint8_t* data,
+                       size_t size) override;
+    
+    // Queue overflow management
+    void setQueueOverflowPolicy(QueueOverflowPolicy policy) override;
+    void setQueueOverflowCallback(QueueOverflowCallback callback) override;
+    
+    // Cleanup orphaned channels
+    size_t cleanupOrphanedChannels() override;
+    
+    // Service discovery
+    std::vector<ServiceDescriptor> discoverServices(
+        const std::string& group = "",
+        ServiceType type = ServiceType::ALL) override;
+    
+    std::vector<std::string> findNodesByCapability(
+        const std::string& capability) override;
+    
+    std::vector<ServiceDescriptor> findLargeDataChannels(
+        const std::string& group = "") override;
+    
+    void setServiceDiscoveryCallback(ServiceDiscoveryCallback callback) override;
+    
     // Performance statistics
     struct QueueStats {
         size_t queue_depth[NUM_PROCESSING_THREADS];  // Current depth per thread
@@ -157,6 +188,31 @@ private:
     std::unique_ptr<UdpTransport> udp_transport_;                   // For remote communication
     std::unique_ptr<SharedMemoryTransportV3> shm_transport_v3_;     // For local communication (dynamic)
     
+    // Large data channels: channel_name -> LargeDataChannel
+    mutable std::mutex large_channels_mutex_;
+    std::map<std::string, std::shared_ptr<LargeDataChannel>> large_channels_;
+    
+    // Internal helper: Get or create large data channel
+    std::shared_ptr<LargeDataChannel> getLargeDataChannel(const std::string& channel_name);
+    
+    // Service discovery helpers
+    void registerService(const ServiceDescriptor& svc);
+    void unregisterService(const ServiceDescriptor& svc);
+    void broadcastServiceUpdate(const ServiceDescriptor& svc, bool is_add);
+    void broadcastNodeEvent(bool is_joined);  // Broadcast NODE_JOIN/NODE_LEAVE event
+    void queryExistingServices();  // Query services from other nodes at startup
+    void handleServiceUpdate(const std::string& from_node,
+                           const ServiceDescriptor& svc,
+                           bool is_add);
+    void handleServiceMessage(const std::string& from_node,
+                            const std::string& group,
+                            const std::string& topic,
+                            const uint8_t* payload,
+                            size_t payload_len,
+                            bool is_register);
+    void handleNodeEvent(const std::string& from_node, bool is_joined);
+    void notifyNodeEvent(ServiceEvent event, const std::string& node_id);
+    
     // Async message processing
     static constexpr size_t MAX_QUEUE_SIZE = 25000;       // Max messages per queue (increased for high throughput)
     mutable std::mutex message_queue_mutexes_[NUM_PROCESSING_THREADS];
@@ -164,6 +220,26 @@ private:
     std::queue<PendingMessage> message_queues_[NUM_PROCESSING_THREADS];  // One queue per thread
     std::vector<std::thread> processing_threads_;
     std::atomic<size_t> dropped_messages_{0};  // Counter for dropped messages due to queue overflow
+    
+    // Queue overflow policy
+    QueueOverflowPolicy overflow_policy_{QueueOverflowPolicy::DROP_OLDEST};
+    QueueOverflowCallback overflow_callback_;
+    std::mutex overflow_callback_mutex_;
+    
+    // Background cleanup thread
+    std::thread cleanup_thread_;
+    std::atomic<bool> cleanup_running_{false};
+    void cleanupThreadFunc();
+    
+    // Service discovery state
+    mutable std::mutex capabilities_mutex_;
+    std::set<std::string> capabilities_;  // This node's capabilities (auto-registered)
+    ServiceDiscoveryCallback service_discovery_callback_;
+    std::mutex service_callback_mutex_;
+    
+    // Global service registry (shared across all nodes in process)
+    static std::mutex service_registry_mutex_;
+    static std::map<std::string, std::vector<ServiceDescriptor>> global_service_registry_;
     
     // Global registry for in-process communication
     static std::mutex registry_mutex_;

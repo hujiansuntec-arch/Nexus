@@ -16,6 +16,10 @@ enum class MessageType : uint8_t {
     UNSUBSCRIBE         = 2,  // Unsubscribe notification
     QUERY_SUBSCRIPTIONS = 3,  // Query all subscriptions from existing nodes
     SUBSCRIPTION_REPLY  = 4,  // Reply with subscription information
+    SERVICE_REGISTER    = 5,  // Service registration (for service discovery)
+    SERVICE_UNREGISTER  = 6,  // Service unregistration (for service discovery)
+    NODE_JOIN           = 7,  // Node joined notification
+    NODE_LEAVE          = 8,  // Node leaving notification
 };
 
 /**

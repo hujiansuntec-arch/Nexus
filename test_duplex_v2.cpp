@@ -107,7 +107,7 @@ public:
             }
             
             // 发送消息
-            node_->broadcast("duplex", peer_topic_,
+            node_->publish("duplex", peer_topic_,
                            std::string((char*)payload.data(), payload.size()));
             sent_.fetch_add(1, std::memory_order_relaxed);
             
