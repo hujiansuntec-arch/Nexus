@@ -123,17 +123,13 @@ void UdpTransport::shutdown() {
 bool UdpTransport::send(const uint8_t* data, size_t size, 
                        const std::string& dest_addr, 
                        uint16_t dest_port) {
-    if (!initialized_ || socket_fd_ < 0) {
-        return false;
-    }
-    
-    if (!data || size == 0) {
+    if (!initialized_ || socket_fd_ < 0 || !data || size == 0) {
         return false;
     }
     
     // Determine destination
-    std::string addr = dest_addr.empty() ? BROADCAST_ADDR : dest_addr;
-    uint16_t port = (dest_port == 0) ? DEFAULT_BROADCAST_PORT : dest_port;
+    const std::string& addr = dest_addr.empty() ? BROADCAST_ADDR : dest_addr;
+    const uint16_t port = (dest_port == 0) ? DEFAULT_BROADCAST_PORT : dest_port;
     
     // Setup destination address
     struct sockaddr_in dest;
@@ -146,7 +142,7 @@ bool UdpTransport::send(const uint8_t* data, size_t size,
     }
     
     // Send data
-    ssize_t sent = sendto(socket_fd_, data, size, 0,
+    const ssize_t sent = sendto(socket_fd_, data, size, 0,
                          reinterpret_cast<struct sockaddr*>(&dest), 
                          sizeof(dest));
     
@@ -185,7 +181,8 @@ void UdpTransport::receiveThread() {
             {
                 std::lock_guard<std::mutex> lock(callback_mutex_);
                 if (receive_callback_) {
-                    NEXUS_DEBUG("Dup") << "receive_callback_ ";
+                    NEXUS_DEBUG("Udp") << "UDP Received message from " << from_address 
+                              << " (" << received << " bytes)";
                     receive_callback_(buffer.data(), static_cast<size_t>(received), from_address);
                 }
             }

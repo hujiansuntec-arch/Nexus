@@ -51,7 +51,6 @@ crasher.log
 # Temporary files
 *.tmp
 *.bak
-core
 core.*
 
 # Test scripts (generated)

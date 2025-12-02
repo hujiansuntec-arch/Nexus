@@ -1,4 +1,5 @@
 #include "nexus/registry/SharedMemoryRegistry.h"
+#include "nexus/utils/Logger.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -42,7 +43,7 @@ SharedMemoryRegistry::~SharedMemoryRegistry() {
         
         // 🔧 如果所有节点都退出，清理Registry
         if (all_nodes_gone) {
-            std::cout << "[Registry] All nodes exited, cleaning up registry" << std::endl;
+            NEXUS_LOG_INFO("Registry", "All nodes exited, cleaning up registry");
         }
     }
     
@@ -73,13 +74,13 @@ bool SharedMemoryRegistry::initialize() {
         // Create new registry
         shm_fd_ = shm_open(REGISTRY_SHM_NAME, O_CREAT | O_RDWR, 0666);
         if (shm_fd_ < 0) {
-            std::cerr << "[Registry] Failed to create registry: " << strerror(errno) << std::endl;
+            NEXUS_LOG_ERROR("Registry", "Failed to create registry: " + std::string(strerror(errno)));
             return false;
         }
         
         // Set size
         if (ftruncate(shm_fd_, sizeof(RegistryRegion)) < 0) {
-            std::cerr << "[Registry] Failed to set size: " << strerror(errno) << std::endl;
+            NEXUS_LOG_ERROR("Registry", "Failed to set size: " + std::string(strerror(errno)));
             close(shm_fd_);
             shm_fd_ = -1;
             shm_unlink(REGISTRY_SHM_NAME);
@@ -90,7 +91,7 @@ bool SharedMemoryRegistry::initialize() {
     // Map memory
     shm_ptr_ = mmap(nullptr, sizeof(RegistryRegion), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd_, 0);
     if (shm_ptr_ == MAP_FAILED) {
-        std::cerr << "[Registry] Failed to map memory: " << strerror(errno) << std::endl;
+        NEXUS_LOG_ERROR("Registry", "Failed to map memory: " + std::string(strerror(errno)));
         close(shm_fd_);
         shm_fd_ = -1;
         if (creating) {
@@ -117,11 +118,11 @@ bool SharedMemoryRegistry::initialize() {
             registry_->entries[i].last_heartbeat.store(0);
         }
         
-        std::cout << "[Registry] Created new registry at " << REGISTRY_SHM_NAME << std::endl;
+        NEXUS_LOG_INFO("Registry", "Created new registry at " + std::string(REGISTRY_SHM_NAME));
     } else {
         // Verify existing registry
         if (registry_->header.magic.load() != MAGIC) {
-            std::cerr << "[Registry] Invalid magic number" << std::endl;
+            NEXUS_LOG_ERROR("Registry", "Invalid magic number");
             munmap(shm_ptr_, sizeof(RegistryRegion));
             shm_ptr_ = nullptr;
             close(shm_fd_);
@@ -129,8 +130,8 @@ bool SharedMemoryRegistry::initialize() {
             return false;
         }
         
-        std::cout << "[Registry] Opened existing registry with " 
-                  << registry_->header.num_entries.load() << " entries" << std::endl;
+        NEXUS_LOG_INFO("Registry", "Opened existing registry with " + 
+                      std::to_string(registry_->header.num_entries.load()) + " entries");
     }
     
     initialized_ = true;
@@ -147,7 +148,7 @@ bool SharedMemoryRegistry::registerNode(const std::string& node_id, const std::s
     }
     
     if (node_id.size() >= NODE_ID_SIZE || shm_name.size() >= SHM_NAME_SIZE) {
-        std::cerr << "[Registry] Node ID or shm name too long" << std::endl;
+        NEXUS_LOG_ERROR("Registry", "Node ID or shm name too long");
         return false;
     }
     
@@ -162,14 +163,14 @@ bool SharedMemoryRegistry::registerNode(const std::string& node_id, const std::s
         entry.last_heartbeat.store(getCurrentTimeMs());
         entry.flags.store(0x3);  // valid | active
         
-        std::cout << "[Registry] Updated node: " << node_id << " -> " << shm_name << std::endl;
+        NEXUS_LOG_INFO("Registry", "Updated node: " + node_id + " -> " + shm_name);
         return true;
     }
     
     // Find free entry
     int idx = findFreeEntryIndex();
     if (idx < 0) {
-        std::cerr << "[Registry] Registry full (max " << MAX_REGISTRY_ENTRIES << " nodes)" << std::endl;
+        NEXUS_LOG_ERROR("Registry", "Registry full (max " + std::to_string(MAX_REGISTRY_ENTRIES) + " nodes)");
         return false;
     }
     
@@ -185,8 +186,8 @@ bool SharedMemoryRegistry::registerNode(const std::string& node_id, const std::s
     
     registry_->header.num_entries.fetch_add(1);
     
-    std::cout << "[Registry] Registered node: " << node_id << " -> " << shm_name 
-              << " (total: " << registry_->header.num_entries.load() << ")" << std::endl;
+    NEXUS_LOG_INFO("Registry", "Registered node: " + node_id + " -> " + shm_name + 
+                  " (total: " + std::to_string(registry_->header.num_entries.load()) + ")");
     
     return true;
 }
@@ -211,8 +212,8 @@ bool SharedMemoryRegistry::unregisterNode(const std::string& node_id) {
     
     registry_->header.num_entries.fetch_sub(1);
     
-    std::cout << "[Registry] Unregistered node: " << node_id 
-              << " (remaining: " << registry_->header.num_entries.load() << ")" << std::endl;
+    NEXUS_LOG_INFO("Registry", "Unregistered node: " + node_id + 
+                  " (remaining: " + std::to_string(registry_->header.num_entries.load()) + ")");
     
     return true;
 }
@@ -314,8 +315,8 @@ int SharedMemoryRegistry::cleanupStaleNodes(uint64_t timeout_ms) {
         bool process_dead = !isProcessAlive(entry.pid);
         
         if (timeout || process_dead) {
-            std::cout << "[Registry] Cleaning stale node: " << entry.node_id 
-                      << (timeout ? " (timeout)" : " (process dead)") << std::endl;
+            NEXUS_LOG_INFO("Registry", "Cleaning stale node: " + std::string(entry.node_id) + 
+                          (timeout ? " (timeout)" : " (process dead)"));
             
             entry.flags.store(0);
             entry.node_id[0] = '\0';
@@ -371,7 +372,7 @@ bool SharedMemoryRegistry::cleanupOrphanedRegistry() {
     
     if (!has_alive) {
         shm_unlink(REGISTRY_SHM_NAME);
-        std::cout << "[Registry] Cleaned up orphaned registry" << std::endl;
+        NEXUS_LOG_INFO("Registry", "Cleaned up orphaned registry");
     }
     
     return true;

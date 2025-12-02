@@ -871,6 +871,8 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
                 has_messages = true;
                 
                 if (receive_callback_) {
+                    NEXUS_DEBUG("SHM-V3") << "Received message from " << from_node 
+                              << " (" << msg_size << " bytes)";
                     receive_callback_(buffer, msg_size, from_node);
                 }
             }
