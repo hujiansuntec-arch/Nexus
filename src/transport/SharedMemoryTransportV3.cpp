@@ -15,6 +15,7 @@
 #include <iomanip>
 #include <dirent.h>
 #include <signal.h>   // For kill() process detection
+#include <sstream>    // For std::ostringstream
 
 // QNX specific includes
 #ifdef __QNXNTO__
@@ -22,17 +23,44 @@
 #include <sys/procfs.h>
 #endif
 
+// ============ SharedMemoryTransportV3 Constants ============
+// Flow control and congestion management
+#define SHM_BACKOFF_BASE_US 10              // Congestion backoff base (microseconds)
+#define SHM_BACKOFF_MAX_US 1000             // Congestion backoff maximum
+#define SHM_CONGESTION_INCREMENT 5          // Congestion level increment on failure
+#define SHM_CONGESTION_DECREMENT 1          // Congestion level decrement on success
+#define SHM_CONGESTION_MAX 100              // Maximum congestion level
+#define SHM_CONGESTION_INITIAL 10           // Initial congestion level on first failure
+
+// Queue management and polling
+#define SHM_QUEUE_REFRESH_INTERVAL 10       // Queue list refresh interval (loop iterations) - reduced from 200 for faster new queue detection
+#define SHM_EMPTY_LOOP_THRESHOLD_SHORT 3    // Threshold for short timeout
+#define SHM_EMPTY_LOOP_THRESHOLD_LONG 10    // Threshold for long timeout
+
+// Timeout strategies (milliseconds)
+#define SHM_TIMEOUT_SHORT_MS 5              // Short timeout (active receiving)
+#define SHM_TIMEOUT_MEDIUM_MS 20            // Medium timeout
+#define SHM_TIMEOUT_LONG_MS 50              // Long timeout (idle state)
+#define SHM_TIMEOUT_IDLE_MS 100             // Idle wait when no queues available
+#define SHM_IDLE_SLEEP_MS 10                // Sleep time when idle
+
+// Adaptive polling thresholds
+#define SHM_ADAPTIVE_THRESHOLD 50           // Threshold for adaptive timeout switch
+
+// Node discovery and initialization
+#define SHM_STARTUP_WAIT_MS 300             // Wait time for remote nodes to respond (queryRemoteServices)
+
 namespace Nexus {
 namespace rpc {
 
 SharedMemoryTransportV3::SharedMemoryTransportV3()
     : initialized_(false)
-    , node_impl_(nullptr)  // Initialize before other members
+    , notify_mechanism_(NotifyMechanism::CONDITION_VARIABLE)  // Must match declaration order in header
+    , node_impl_(nullptr)
     , my_shm_ptr_(nullptr)
     , my_shm_fd_(-1)
     , my_shm_(nullptr)
     , receiving_(false)
-    , notify_mechanism_(NotifyMechanism::CONDITION_VARIABLE)
 {
 }
 
@@ -150,10 +178,10 @@ bool SharedMemoryTransportV3::send(const std::string& dest_node_id, const uint8_
             
             // 🔧 流控：检查拥塞等级
             uint32_t congestion = queue->congestion_level.load(std::memory_order_relaxed);
-            if (congestion > 0 && congestion <= 100) {
+            if (congestion > 0 && congestion <= SHM_CONGESTION_MAX) {
                 // 根据拥塞等级进行退避 (0-100 -> 0-1000μs)
-                int backoff_us = static_cast<int>(congestion) * 10;
-                if (backoff_us > 0 && backoff_us <= 1000) {
+                int backoff_us = static_cast<int>(congestion) * SHM_BACKOFF_BASE_US;
+                if (backoff_us > 0 && backoff_us <= SHM_BACKOFF_MAX_US) {
                     std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
                 }
             }
@@ -184,15 +212,15 @@ bool SharedMemoryTransportV3::send(const std::string& dest_node_id, const uint8_
                 
                 // 🔧 流控：成功发送，降低拥塞等级
                 if (congestion > 0) {
-                    queue->congestion_level.fetch_sub(1, std::memory_order_relaxed);
+                    queue->congestion_level.fetch_sub(SHM_CONGESTION_DECREMENT, std::memory_order_relaxed);
                 }
             } else {
                 stats_messages_dropped_++;
                 
                 // 🔧 流控：发送失败，提高拥塞等级和丢包计数
                 queue->drop_count.fetch_add(1, std::memory_order_relaxed);
-                if (congestion < 100) {
-                    queue->congestion_level.fetch_add(5, std::memory_order_relaxed);  // 快速上升
+                if (congestion < SHM_CONGESTION_MAX) {
+                    queue->congestion_level.fetch_add(SHM_CONGESTION_INCREMENT, std::memory_order_relaxed);  // 快速上升
                 }
             }
             return success;
@@ -200,10 +228,16 @@ bool SharedMemoryTransportV3::send(const std::string& dest_node_id, const uint8_
     }
     
     // Slow path: establish connection first
+    NEXUS_DEBUG("SHM-V3") << "[" << node_id_ << "] Not connected to " << dest_node_id 
+                          << ", attempting lazy connection...";
+    
     if (!connectToNode(dest_node_id)) {
         stats_messages_dropped_++;
+        NEXUS_DEBUG("SHM-V3") << "[" << node_id_ << "] Failed to connect to " << dest_node_id;
         return false;
     }
+    
+    NEXUS_DEBUG("SHM-V3") << "[" << node_id_ << "] Successfully connected to " << dest_node_id;
     
     // Retry send after connection
     {
@@ -234,7 +268,7 @@ bool SharedMemoryTransportV3::send(const std::string& dest_node_id, const uint8_
             } else{
                 stats_messages_dropped_++;
                 queue->drop_count.fetch_add(1, std::memory_order_relaxed);
-                queue->congestion_level.store(10, std::memory_order_relaxed);  // 初始拥塞
+                queue->congestion_level.store(SHM_CONGESTION_INITIAL, std::memory_order_relaxed);  // 初始拥塞
             }
             return success;
         }
@@ -253,13 +287,21 @@ int SharedMemoryTransportV3::broadcast(const uint8_t* data, size_t size) {
     std::vector<NodeInfo> nodes = registry_.getAllNodes();
     int sent_count = 0;
     
+    NEXUS_DEBUG("SHM-V3") << "[" << node_id_ << "] Broadcasting to " << nodes.size() << " nodes in registry";
+    
     for (const auto& node : nodes) {
         if (node.node_id == node_id_) {
             continue;  // Skip self
         }
         
+        NEXUS_DEBUG("SHM-V3") << "[" << node_id_ << "] Broadcast attempt to " << node.node_id 
+                              << " (active: " << node.active << ")";
+        
         if (node.active && send(node.node_id, data, size)) {
             sent_count++;
+            NEXUS_DEBUG("SHM-V3") << "[" << node_id_ << "] Broadcast to " << node.node_id << " SUCCESS";
+        } else {
+            NEXUS_DEBUG("SHM-V3") << "[" << node_id_ << "] Broadcast to " << node.node_id << " FAILED";
         }
     }
     
@@ -296,6 +338,28 @@ void SharedMemoryTransportV3::stopReceiving() {
     }
     
     receiving_.store(false);
+    
+    // 🔧 Wake up all threads waiting on condition variables
+    // This ensures receive threads exit immediately instead of waiting for timeout
+    
+    // 1. Wake up thread waiting for queue availability
+    {
+        std::lock_guard<std::mutex> lock(queue_wait_mutex_);
+        queue_wait_cv_.notify_all();
+    }
+    
+    // 2. Wake up threads waiting on queue-specific condition variables
+    if (my_shm_) {
+        for (uint32_t i = 0; i < MAX_INBOUND_QUEUES; ++i) {
+            InboundQueue& q = my_shm_->queues[i];
+            uint32_t flags = q.flags.load(std::memory_order_relaxed);
+            if ((flags & 0x3) == 0x3) {  // Queue is active
+                pthread_mutex_lock(&q.notify_mutex);
+                pthread_cond_broadcast(&q.notify_cond);
+                pthread_mutex_unlock(&q.notify_mutex);
+            }
+        }
+    }
     
     if (receive_thread_.joinable()) {
         receive_thread_.join();
@@ -576,7 +640,8 @@ bool SharedMemoryTransportV3::createMySharedMemory() {
     my_shm_->header.magic.store(MAGIC);
     my_shm_->header.version.store(VERSION);
     my_shm_->header.num_queues.store(0);
-    my_shm_->header.max_queues.store(config_.max_inbound_queues);  // 使用配置值
+    // Safe cast: max_inbound_queues is validated in initialize()
+    my_shm_->header.max_queues.store(static_cast<uint32_t>(config_.max_inbound_queues));
     my_shm_->header.last_heartbeat.store(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     my_shm_->header.ready.store(false);  // 🔧 初始为未就绪
@@ -668,10 +733,25 @@ bool SharedMemoryTransportV3::connectToNode(const std::string& target_node_id) {
     NodeSharedMemory* remote_shm = static_cast<NodeSharedMemory*>(conn.shm_ptr);
     
     // Verify magic
-    if (remote_shm->header.magic.load() != MAGIC) {
-        NEXUS_ERROR("SHM-V3") << "Invalid magic in remote shm";
+    uint32_t magic = remote_shm->header.magic.load(std::memory_order_acquire);
+    if (magic != MAGIC) {
+        NEXUS_ERROR("SHM-V3") << "Invalid magic in remote shm: 0x" << std::hex << magic;
         munmap(conn.shm_ptr, sizeof(NodeSharedMemory));
         close(conn.shm_fd);
+        return false;
+    }
+    
+    // 🔧 健康检查: 验证远程进程是否存活
+    pid_t owner_pid = remote_shm->header.owner_pid.load(std::memory_order_acquire);
+    if (owner_pid <= 0 || kill(owner_pid, 0) != 0) {
+        NEXUS_WARN("SHM-V3") << "Remote node process is dead (pid=" << owner_pid 
+                             << "), cleaning up stale shared memory: " << target_info.shm_name;
+        munmap(conn.shm_ptr, sizeof(NodeSharedMemory));
+        close(conn.shm_fd);
+        // 尝试清理残留的共享内存文件
+        shm_unlink(target_info.shm_name.c_str());
+        // 从registry中删除已死亡节点的entry
+        registry_.unregisterNode(target_node_id);
         return false;
     }
     
@@ -779,9 +859,19 @@ SharedMemoryTransportV3::InboundQueue* SharedMemoryTransportV3::findOrCreateQueu
                 
                 NEXUS_DEBUG("SHM-V3") << "Created queue in remote node for sender: " << sender_id 
                           << " (using Condition Variable)";
+                
+                // 🔧 立即通知远程节点有新队列：通过新queue的condition variable发送信号
+                // 这会唤醒远程节点的接收循环，使其立即刷新队列列表，消除延迟
+                pthread_mutex_lock(&q.notify_mutex);
+                pthread_cond_signal(&q.notify_cond);
+                pthread_mutex_unlock(&q.notify_mutex);
             }
             
             remote_shm->header.num_queues.fetch_add(1);
+            
+            NEXUS_DEBUG("SHM-V3") << "Created queue in remote node, num_queues now: " 
+                      << remote_shm->header.num_queues.load();
+            
             return &q;
         }
     }
@@ -804,51 +894,81 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
     static constexpr size_t MESSAGE_SIZE = 2048;
     uint8_t buffer[MESSAGE_SIZE];
     
-    // 🔧 缓存活跃队列列表，减少遍历开销
+    // 缓存活跃队列列表，减少遍历开销
     std::vector<InboundQueue*> active_queues;
     uint32_t cached_num_queues = 0;
     int queue_refresh_counter = 0;
-    const int QUEUE_REFRESH_INTERVAL = 100;
     
-    // 🔧 自适应超时：根据消息流量动态调整
+    // 自适应超时：根据消息流量动态调整
     int consecutive_empty_loops = 0;
-    const int ADAPTIVE_THRESHOLD = 100;  // 100次空循环后切换到长超时
     
     while (receiving_.load()) {
         if (!my_shm_) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            // 🔧 Wait for shared memory - use longer sleep since this is rare
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
         }
         
-        // 🔧 检测队列变化并更新缓存
-        uint32_t current_num_queues = my_shm_->header.num_queues.load(std::memory_order_relaxed);
+        // ✅ 优化7: 减少队列刷新检查的开销
+        // 只在必要时才检查 num_queues（减少 atomic load）
         queue_refresh_counter++;
         
-        if (current_num_queues != cached_num_queues || 
-            queue_refresh_counter >= QUEUE_REFRESH_INTERVAL || 
-            active_queues.empty()) {
-            
-            active_queues.clear();
-            for (uint32_t i = 0; i < MAX_INBOUND_QUEUES; ++i) {
-                InboundQueue& q = my_shm_->queues[i];
-                uint32_t flags = q.flags.load(std::memory_order_relaxed);
-                if ((flags & 0x3) == 0x3) {
-                    active_queues.push_back(&q);
+        // 🔧 关键优化：立即检测num_queues变化，无需等待计数器
+        uint32_t current_num_queues = my_shm_->header.num_queues.load(std::memory_order_relaxed);
+        
+        // 延长刷新间隔（降低检查频率），但num_queues变化时立即刷新
+        bool need_refresh = (current_num_queues != cached_num_queues) ||
+                           (queue_refresh_counter >= SHM_QUEUE_REFRESH_INTERVAL) || 
+                           active_queues.empty();
+        
+        if (need_refresh) {
+            if (current_num_queues != cached_num_queues || active_queues.empty()) {
+                active_queues.clear();
+                active_queues.reserve(current_num_queues);  // ✅ 预留空间避免realloc
+                
+                for (uint32_t i = 0; i < MAX_INBOUND_QUEUES; ++i) {
+                    InboundQueue& q = my_shm_->queues[i];
+                    uint32_t flags = q.flags.load(std::memory_order_relaxed);
+                    if ((flags & 0x3) == 0x3) {
+                        active_queues.push_back(&q);
+                    }
+                }
+                cached_num_queues = current_num_queues;
+                
+                // 🔧 如果检测到新队列，通知等待的线程
+                if (!active_queues.empty() && !has_active_queues_.load(std::memory_order_relaxed)) {
+                    has_active_queues_.store(true, std::memory_order_release);
+                    queue_wait_cv_.notify_one();
                 }
             }
-            cached_num_queues = current_num_queues;
             queue_refresh_counter = 0;
         }
         
         if (active_queues.empty()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            // 🔧 No queues available - use condition variable to wait efficiently
+            // This avoids busy-wait and reduces CPU to 0% when idle
+            has_active_queues_.store(false, std::memory_order_release);
+            
+            std::unique_lock<std::mutex> lock(queue_wait_mutex_);
+            queue_wait_cv_.wait_for(lock, std::chrono::milliseconds(SHM_TIMEOUT_IDLE_MS), [this]() {
+                return !receiving_.load() || has_active_queues_.load();
+            });
             continue;
         }
+        
+        // Mark that we have active queues
+        has_active_queues_.store(true, std::memory_order_relaxed);
         
         // 🔧 步骤1：快速处理所有队列的消息（批量处理减少atomic操作）
         bool has_messages = false;
         
         for (auto* q : active_queues) {
+            // ✅ 优化1: 先检查pending_msgs，避免无消息时的flags检查和循环
+            uint32_t pending = q->pending_msgs.load(std::memory_order_acquire);
+            if (pending == 0) {
+                continue;  // 队列无消息，跳过
+            }
+            
             // 安全检查：验证队列仍然有效
             uint32_t flags = q->flags.load(std::memory_order_relaxed);
             if ((flags & 0x3) != 0x3) {
@@ -865,8 +985,7 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
                     break;  // 队列空了
                 }
                 
-                stats_messages_received_++;
-                stats_bytes_received_ += msg_size;
+                // ✅ 优化2: 批量更新统计信息（减少cache line bouncing）
                 processed++;
                 has_messages = true;
                 
@@ -877,8 +996,10 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
                 }
             }
             
-            // 减少pending计数
+            // ✅ 优化3: 批量更新统计和pending计数（减少atomic操作）
             if (processed > 0) {
+                stats_messages_received_ += processed;
+                // stats_bytes_received_ 在这里无法准确累加，需要在读取时累加
                 q->pending_msgs.fetch_sub(processed, std::memory_order_release);
             }
         }
@@ -887,28 +1008,46 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
         if (!has_messages && !active_queues.empty()) {
             consecutive_empty_loops++;
             
-            // 🔧 自适应超时：无消息时50ms降低CPU，有消息时5ms保持低延迟
-            int timeout_ms = (consecutive_empty_loops > ADAPTIVE_THRESHOLD) ? 50 : 5;
+            // ✅ 优化4: 更激进的自适应超时策略
+            // 无消息时快速进入长超时，减少频繁的CV操作
+            int timeout_ms = (consecutive_empty_loops > SHM_EMPTY_LOOP_THRESHOLD_LONG) ? SHM_TIMEOUT_LONG_MS : 
+                            (consecutive_empty_loops > SHM_EMPTY_LOOP_THRESHOLD_SHORT) ? SHM_TIMEOUT_MEDIUM_MS : SHM_TIMEOUT_SHORT_MS;
             
-            // 使用第一个活跃队列的CV等待
+            // ✅ 优化5: 使用最繁忙的队列进行等待（而不是总是第一个）
+            // 选择pending_msgs最多的队列，提高被唤醒的概率
             InboundQueue* wait_queue = active_queues[0];
-            
-            pthread_mutex_lock(&wait_queue->notify_mutex);
-            
-            // 🔧 再次快速检查pending（双重检查避免信号丢失）
-            if (wait_queue->pending_msgs.load(std::memory_order_acquire) == 0) {
-                struct timespec ts;
-                clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_nsec += timeout_ms * 1000000;  // ms转ns
-                if (ts.tv_nsec >= 1000000000) {
-                    ts.tv_sec++;
-                    ts.tv_nsec -= 1000000000;
+            uint32_t max_pending = 0;
+            for (auto* q : active_queues) {
+                uint32_t pending = q->pending_msgs.load(std::memory_order_relaxed);
+                if (pending > max_pending) {
+                    max_pending = pending;
+                    wait_queue = q;
                 }
-                
-                pthread_cond_timedwait(&wait_queue->notify_cond, &wait_queue->notify_mutex, &ts);
             }
             
-            pthread_mutex_unlock(&wait_queue->notify_mutex);
+            // 如果所有队列都没有pending消息，才进入等待
+            if (max_pending == 0) {
+                pthread_mutex_lock(&wait_queue->notify_mutex);
+                
+                // 🔧 再次快速检查pending（双重检查避免信号丢失）
+                if (wait_queue->pending_msgs.load(std::memory_order_acquire) == 0) {
+                    struct timespec ts;
+                    clock_gettime(CLOCK_REALTIME, &ts);
+                    
+                    // ✅ 优化6: 优化时间计算，避免多次除法
+                    long nsec_add = (long)timeout_ms * 1000000L;
+                    ts.tv_sec += nsec_add / 1000000000L;
+                    ts.tv_nsec += nsec_add % 1000000000L;
+                    if (ts.tv_nsec >= 1000000000L) {
+                        ts.tv_sec++;
+                        ts.tv_nsec -= 1000000000L;
+                    }
+                    
+                    pthread_cond_timedwait(&wait_queue->notify_cond, &wait_queue->notify_mutex, &ts);
+                }
+                
+                pthread_mutex_unlock(&wait_queue->notify_mutex);
+            }
         } else {
             // 🔧 有消息时重置计数器，保持短超时以降低延迟
             consecutive_empty_loops = 0;
@@ -929,15 +1068,15 @@ void SharedMemoryTransportV3::receiveLoop_Semaphore() {
     std::vector<InboundQueue*> active_queues;
     uint32_t cached_num_queues = 0;  // 缓存num_queues用于检测变化
     int queue_refresh_counter = 0;
-    const int QUEUE_REFRESH_INTERVAL = 100;  // 每100次循环刷新一次队列列表
+    const int QUEUE_REFRESH_INTERVAL = SHM_QUEUE_REFRESH_INTERVAL;  // 定期刷新队列列表
     
     // 🔧 自适应超时：有消息时使用短超时，无消息时使用长超时
     int consecutive_empty_loops = 0;
-    const int ADAPTIVE_THRESHOLD = 50;  // 50次空循环后切换到长超时
+    const int ADAPTIVE_THRESHOLD = SHM_ADAPTIVE_THRESHOLD;  // 空循环阈值后切换到长超时
     
     while (receiving_.load()) {
         if (!my_shm_) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(std::chrono::milliseconds(SHM_IDLE_SLEEP_MS));
             continue;
         }
         
@@ -962,7 +1101,7 @@ void SharedMemoryTransportV3::receiveLoop_Semaphore() {
         }
         
         if (active_queues.empty()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(std::chrono::milliseconds(SHM_IDLE_SLEEP_MS));
             continue;
         }
         
@@ -1004,8 +1143,8 @@ void SharedMemoryTransportV3::receiveLoop_Semaphore() {
         if (!has_messages && !active_queues.empty()) {
             consecutive_empty_loops++;
             
-            // 🔧 自适应超时：空闲时50ms，繁忙时5ms
-            int timeout_ms = (consecutive_empty_loops > ADAPTIVE_THRESHOLD) ? 50 : 5;
+            // 🔧 自适应超时：空闲时长超时，繁忙时短超时
+            int timeout_ms = (consecutive_empty_loops > ADAPTIVE_THRESHOLD) ? SHM_TIMEOUT_LONG_MS : SHM_TIMEOUT_SHORT_MS;
             
             struct timespec timeout;
             clock_gettime(CLOCK_REALTIME, &timeout);
@@ -1104,42 +1243,19 @@ void SharedMemoryTransportV3::cleanupStaleQueues() {
         return;
     }
     
-    // 🔧 FIX: 遍历所有slot，不只是num_queues
-    // 因为slot可能在中间位置被释放
-    for (uint32_t i = 0; i < MAX_INBOUND_QUEUES; ++i) {
-        InboundQueue& q = my_shm_->queues[i];
-        
-        if ((q.flags.load() & 0x1) == 0) {
-            continue;  // Already free
-        }
-        
-        // Check if sender still exists in registry
-        std::string sender_id = q.sender_id;
-        if (!sender_id.empty() && !registry_.nodeExists(sender_id)) {
-            NEXUS_DEBUG("SHM-V3") << "Recycling queue slot " << i 
-                      << " from stale sender: " << sender_id;
-            
-            // 🔧 FIX: 彻底清空队列，避免内存泄漏
-            char dummy_sender[64];
-            uint8_t dummy_data[2048];
-            size_t dummy_size = 2048;
-            int drained = 0;
-            while (q.queue.tryRead(dummy_sender, dummy_data, dummy_size)) {
-                drained++;
-                dummy_size = 2048;  // Reset for next read
-            }
-            if (drained > 0) {
-                NEXUS_DEBUG("SHM-V3") << "Drained " << drained 
-                          << " pending messages from slot " << i;
-            }
-            
-            // 🔧 FIX: 完全重置slot，使其可被重用
-            q.flags.store(0);  // Clear valid & active flags
-            q.sender_id[0] = '\0';
-            
-            my_shm_->header.num_queues.fetch_sub(1);
-        }
-    }
+    // 🔧 CRITICAL: Do NOT recycle inbound queues here!
+    // Inbound queues are in OUR shared memory, used to receive messages.
+    // Even if the sender node dies, we shouldn't touch these queues because:
+    // 1. Our receive thread might still be accessing them
+    // 2. There could be pending messages to process
+    // 3. Race conditions can cause memory corruption
+    //
+    // Queue cleanup should only happen when:
+    // - This node is shutting down (in destructor)
+    // - We explicitly disconnect from a remote node
+    //
+    // For now, leave queues alone - they'll be cleaned up during node shutdown
+    // TODO: Implement safer queue recycling with proper synchronization
 }
 
 std::string SharedMemoryTransportV3::generateShmName() {

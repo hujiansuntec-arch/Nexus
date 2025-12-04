@@ -11,6 +11,7 @@
 #include <functional>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <cstdint>
 #include <semaphore.h>
@@ -125,6 +126,14 @@ public:
      * @param node_impl Pointer to NodeImpl instance
      */
     void setNodeImpl(NodeImpl* node_impl) { node_impl_ = node_impl; }
+    
+    /**
+     * @brief Disconnect from a specific node
+     * @param target_node_id Node ID to disconnect from
+     * 
+     * 当节点退出后重新加入时,需要断开旧连接以便重新建立新连接
+     */
+    void disconnectFromNode(const std::string& target_node_id);
     
     /**
      * @brief Get all local node IDs (nodes using shared memory)
@@ -246,7 +255,6 @@ private:
     bool createMySharedMemory();
     void destroyMySharedMemory();
     bool connectToNode(const std::string& target_node_id);
-    void disconnectFromNode(const std::string& target_node_id);
     InboundQueue* findOrCreateQueue(NodeSharedMemory* remote_shm, const std::string& sender_id);
     void receiveLoop();
     void receiveLoop_Semaphore(); // 🔧 Semaphore模式的接收循环
@@ -282,6 +290,11 @@ private:
     std::thread heartbeat_thread_;
     std::atomic<bool> receiving_;
     ReceiveCallback receive_callback_;
+    
+    // Condition variable for queue availability (used when active_queues is empty)
+    std::mutex queue_wait_mutex_;
+    std::condition_variable queue_wait_cv_;
+    std::atomic<bool> has_active_queues_{false};
     
     // Configuration constants
     static constexpr uint64_t HEARTBEAT_INTERVAL_MS = 1000;  // 1 second

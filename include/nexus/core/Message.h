@@ -44,7 +44,18 @@ struct MessagePacket {
     uint32_t checksum;       // Simple checksum
     char node_id[64];        // Source node ID
     uint16_t udp_port;       // Sender's UDP port
-    char data[];             // Variable length data: [group][topic][payload]
+    // Variable length data: [group][topic][payload]
+    // QNX compatibility: Use array[1] instead of flexible array member on QNX
+    // to ensure stable sizeof() behavior and proper memory alignment
+#ifdef __QNXNTO__
+    alignas(8) char data[1];  // QNX: Fixed-size array for better compatibility
+#else
+    // Linux/POSIX: Use flexible array member (C99 extension)
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wpedantic"
+    char data[];              // Flexible array member (C99 extension, well-supported by GCC/Clang)
+    #pragma GCC diagnostic pop
+#endif
     
     // Calculate total packet size
     static size_t packetSize(size_t group_len, size_t topic_len, size_t payload_len) {

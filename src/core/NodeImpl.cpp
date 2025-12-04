@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <chrono>
 #include <iostream>
+#include <unistd.h>  // For getpid()
 #include <cstring>
 
 namespace Nexus {
@@ -18,6 +19,13 @@ namespace rpc {
 static constexpr uint16_t PORT_BASE = 47200;
 static constexpr uint16_t PORT_MAX = 47999;
 static constexpr uint16_t PORT_COUNT = PORT_MAX - PORT_BASE + 1;  // 800 ports
+
+// Cleanup thread constants
+#define CLEANUP_INTERVAL_SECONDS 120  // 2 minutes
+#define CLEANUP_ORPHAN_TIMEOUT_SECONDS 60  // Channels older than 60 seconds
+
+// Message processing constants
+#define MAX_MESSAGE_BATCH_SIZE 16  // Process up to 16 messages per batch
 
 // Note: Static members replaced by Nexus::rpc::GlobalRegistry
 // - node_registry_ -> GlobalRegistry::instance().registerNode()
@@ -33,7 +41,7 @@ static std::string generateNodeId() {
     return ss.str();
 }
 
-NodeImpl::NodeImpl(const std::string& node_id, bool use_udp, uint16_t udp_port,
+NodeImpl::NodeImpl(const std::string& node_id, bool use_udp, [[maybe_unused]] uint16_t udp_port,
                    TransportMode transport_mode)
     : node_id_(node_id.empty() ? generateNodeId() : node_id)
     , use_udp_(use_udp)
@@ -53,6 +61,13 @@ NodeImpl::~NodeImpl() {
     cleanup_running_ = false;
     if (cleanup_thread_.joinable()) {
         cleanup_thread_.join();
+    }
+    
+    // Stop system message thread
+    system_running_.store(false);
+    system_queue_cv_.notify_all();
+    if (system_thread_.joinable()) {
+        system_thread_.join();
     }
     
     // Wake up all processing threads
@@ -93,6 +108,10 @@ void NodeImpl::initialize(uint16_t udp_port) {
         processing_threads_.emplace_back(&NodeImpl::messageProcessingThread, this, i);
     }
     
+    // Start system message processing thread
+    system_running_.store(true);
+    system_thread_ = std::thread(&NodeImpl::systemMessageThread, this);
+    
     // Initialize lock-free shared memory transport
     if (transport_mode_ == TransportMode::AUTO || transport_mode_ == TransportMode::LOCK_FREE_SHM) {
         shm_transport_v3_ = std::make_unique<SharedMemoryTransportV3>();
@@ -107,7 +126,7 @@ void NodeImpl::initialize(uint16_t udp_port) {
             
             // Set receive callback - parse MessagePacket format
             shm_transport_v3_->setReceiveCallback([this](const uint8_t* data, size_t size, 
-                                                         const std::string& from) {
+                                                         [[maybe_unused]] const std::string& from) {
                 // Data should be in MessagePacket format
                 if (size < sizeof(MessagePacket)) {
                     return;
@@ -139,18 +158,42 @@ void NodeImpl::initialize(uint16_t udp_port) {
                         break;
                         
                     case MessageType::SERVICE_REGISTER:
+                        // Enqueue to system message thread (avoid blocking receive thread)
+                        enqueueSystemMessage(SystemMessageType::SERVICE_REGISTER,
+                                           source_node, group, topic,
+                                           packet->getPayload(), packet->payload_len);
+                        break;
+                        
                     case MessageType::SERVICE_UNREGISTER:
-                        handleServiceMessage(source_node, group, topic,
-                                           packet->getPayload(), packet->payload_len,
-                                           msg_type == MessageType::SERVICE_REGISTER);
+                        // Enqueue to system message thread
+                        enqueueSystemMessage(SystemMessageType::SERVICE_UNREGISTER,
+                                           source_node, group, topic,
+                                           packet->getPayload(), packet->payload_len);
                         break;
                         
                     case MessageType::NODE_JOIN:
-                        handleNodeEvent(source_node, true);
+                        // Enqueue to system message thread
+                        NEXUS_DEBUG("IMPL") << "Received NODE_JOIN message from " << source_node;
+                        enqueueSystemMessage(SystemMessageType::NODE_JOIN,
+                                           source_node, group, topic,
+                                           nullptr, 0);
                         break;
                         
                     case MessageType::NODE_LEAVE:
-                        handleNodeEvent(source_node, false);
+                        // Enqueue to system message thread
+                        enqueueSystemMessage(SystemMessageType::NODE_LEAVE,
+                                           source_node, group, topic,
+                                           nullptr, 0);
+                        break;
+                        
+                    case MessageType::SUBSCRIBE:
+                    case MessageType::UNSUBSCRIBE:
+                    case MessageType::QUERY_SUBSCRIPTIONS:
+                    case MessageType::SUBSCRIPTION_REPLY:
+                        // These message types are not used in current implementation
+                        // Reserved for future subscription management features
+                        NEXUS_DEBUG("IMPL") << "Ignoring unused message type: " 
+                                            << static_cast<int>(msg_type);
                         break;
                         
                     case MessageType::HEARTBEAT:
@@ -207,18 +250,31 @@ void NodeImpl::initialize(uint16_t udp_port) {
                     break;
                 
                 case MessageType::SERVICE_REGISTER:
+                    // Enqueue to system message thread (avoid blocking receive thread)
+                    enqueueSystemMessage(SystemMessageType::SERVICE_REGISTER,
+                                       source_node, group, topic,
+                                       packet->getPayload(), packet->payload_len);
+                    break;
+                    
                 case MessageType::SERVICE_UNREGISTER:
-                    handleServiceMessage(source_node, group, topic,
-                                       packet->getPayload(), packet->payload_len,
-                                       msg_type == MessageType::SERVICE_REGISTER);
+                    // Enqueue to system message thread
+                    enqueueSystemMessage(SystemMessageType::SERVICE_UNREGISTER,
+                                       source_node, group, topic,
+                                       packet->getPayload(), packet->payload_len);
                     break;
                     
                 case MessageType::NODE_JOIN:
-                    handleNodeEvent(source_node, true);
+                    // Enqueue to system message thread
+                    enqueueSystemMessage(SystemMessageType::NODE_JOIN,
+                                       source_node, group, topic,
+                                       nullptr, 0);
                     break;
                     
                 case MessageType::NODE_LEAVE:
-                    handleNodeEvent(source_node, false);
+                    // Enqueue to system message thread
+                    enqueueSystemMessage(SystemMessageType::NODE_LEAVE,
+                                       source_node, group, topic,
+                                       nullptr, 0);
                     break;
                     
                 case MessageType::HEARTBEAT:
@@ -228,6 +284,15 @@ void NodeImpl::initialize(uint16_t udp_port) {
                 case MessageType::QUERY_SUBSCRIPTIONS:
                     // Reply with all our services (UDP service discovery)
                     handleQuerySubscriptions(source_node, sender_port, from_addr);
+                    break;
+                    
+                case MessageType::SUBSCRIBE:
+                case MessageType::UNSUBSCRIBE:
+                case MessageType::SUBSCRIPTION_REPLY:
+                    // These message types are not used in current implementation
+                    // Reserved for future subscription management features
+                    NEXUS_DEBUG("IMPL") << "Ignoring unused message type: " 
+                                        << static_cast<int>(msg_type);
                     break;
             }
         };
@@ -477,26 +542,26 @@ Node::Error NodeImpl::sendLargeData(const std::string& msg_group,
     }
     
     // Auto-register large data service (first send only)
-    std::string capability = msg_group + "/" + channel_name + "/" + topic;
-    {
-        std::lock_guard<std::mutex> lock(capabilities_mutex_);
-        if (capabilities_.find(capability) == capabilities_.end()) {
-            // Register for shared memory (large data only supports SHM)
-            if (shm_transport_v3_ && shm_transport_v3_->isInitialized()) {
-                ServiceDescriptor svc;
-                svc.node_id = node_id_;
-                svc.group = msg_group;
-                svc.topic = topic;
-                svc.type = ServiceType::LARGE_DATA;
-                svc.channel_name = channel_name;
-                svc.transport = TransportType::SHARED_MEMORY;
-                svc.udp_address = "";
+    // std::string capability = msg_group + "/" + channel_name + "/" + topic;
+    // {
+    //     std::lock_guard<std::mutex> lock(capabilities_mutex_);
+    //     if (capabilities_.find(capability) == capabilities_.end()) {
+    //         // Register for shared memory (large data only supports SHM)
+    //         if (shm_transport_v3_ && shm_transport_v3_->isInitialized()) {
+    //             ServiceDescriptor svc;
+    //             svc.node_id = node_id_;
+    //             svc.group = msg_group;
+    //             svc.topic = topic;
+    //             svc.type = ServiceType::LARGE_DATA;
+    //             svc.channel_name = channel_name;
+    //             svc.transport = TransportType::SHARED_MEMORY;
+    //             svc.udp_address = "";
                 
-                registerService(svc);
-                capabilities_.insert(capability);
-            }
-        }
-    }
+    //             registerService(svc);
+    //             capabilities_.insert(capability);
+    //         }
+    //     }
+    // }
     
     // Get or create the large data channel
     auto channel = getLargeDataChannel(channel_name);
@@ -666,6 +731,11 @@ void NodeImpl::deliverInterProcess(const std::vector<uint8_t>& packet,
             continue;
         }
         
+        // Skip LARGE_DATA services - they don't receive normal pub/sub messages
+        if (svc.type != ServiceType::NORMAL_MESSAGE) {
+            continue;
+        }
+        
         // Skip ourselves
         if (svc.node_id == node_id_) {
             continue;
@@ -757,7 +827,7 @@ void NodeImpl::queryExistingSubscriptions() {
     // Scan all ports in range
     for (int port = PORT_BASE; port <= PORT_MAX; port++) {
         if (port != my_port) {
-            udp_transport_->send(packet.data(), packet.size(), "127.0.0.1", port);
+            udp_transport_->send(packet.data(), packet.size(), "127.0.0.1", static_cast<uint16_t>(port));
         }
     }
 }
@@ -901,7 +971,7 @@ void NodeImpl::enqueueMessage(const std::string& source_node_id,
 }
 
 void NodeImpl::messageProcessingThread(size_t thread_id) {
-    static constexpr size_t MAX_BATCH_SIZE = 16;  // Process up to 16 messages per batch
+    static constexpr size_t MAX_BATCH_SIZE = MAX_MESSAGE_BATCH_SIZE;
     std::vector<PendingMessage> batch;
     batch.reserve(MAX_BATCH_SIZE);
     
@@ -951,6 +1021,100 @@ void NodeImpl::messageProcessingThread(size_t thread_id) {
     }
 }
 
+// System message processing thread (dedicated, thread-safe)
+void NodeImpl::systemMessageThread() {
+    NEXUS_DEBUG("IMPL") << "System message thread started for " << node_id_;
+    
+    while (system_running_.load()) {
+        SystemMessage msg;
+        
+        // Wait for system message
+        {
+            std::unique_lock<std::mutex> lock(system_queue_mutex_);
+            system_queue_cv_.wait(lock, [this] {
+                return !system_running_.load() || !system_queue_.empty();
+            });
+            
+            if (!system_running_.load()) {
+                break;
+            }
+            
+            if (system_queue_.empty()) {
+                continue;
+            }
+            
+            msg = std::move(system_queue_.front());
+            system_queue_.pop();
+        }
+        
+        // Process system message (outside of queue lock)
+        // Single-threaded processing ensures thread safety for GlobalRegistry access
+        try {
+            switch (msg.type) {
+                case SystemMessageType::SERVICE_REGISTER:
+                    handleServiceMessage(msg.source_node_id, msg.group, msg.topic,
+                                       msg.payload.data(), msg.payload.size(), true);
+                    break;
+                    
+                case SystemMessageType::SERVICE_UNREGISTER:
+                    handleServiceMessage(msg.source_node_id, msg.group, msg.topic,
+                                       msg.payload.data(), msg.payload.size(), false);
+                    break;
+                    
+                case SystemMessageType::NODE_JOIN:
+                    NEXUS_DEBUG("IMPL") << "Processing NODE_JOIN from " << msg.source_node_id;
+                    handleNodeEvent(msg.source_node_id, true);
+                    break;
+                    
+                case SystemMessageType::NODE_LEAVE:
+                    NEXUS_DEBUG("IMPL") << "Processing NODE_LEAVE from " << msg.source_node_id;
+                    handleNodeEvent(msg.source_node_id, false);
+                    break;
+            }
+        } catch (const std::exception& e) {
+            NEXUS_ERROR("IMPL") << "Exception in system message processing: " << e.what();
+        } catch (...) {
+            NEXUS_ERROR("IMPL") << "Unknown exception in system message processing";
+        }
+    }
+    
+    NEXUS_DEBUG("IMPL") << "System message thread stopped for " << node_id_;
+}
+
+// Enqueue system message (called from receive callback)
+void NodeImpl::enqueueSystemMessage(SystemMessageType type,
+                                   const std::string& source_node_id,
+                                   const std::string& group,
+                                   const std::string& topic,
+                                   const uint8_t* payload,
+                                   size_t payload_len) {
+    SystemMessage msg;
+    msg.type = type;
+    msg.source_node_id = source_node_id;
+    msg.group = group;
+    msg.topic = topic;
+    
+    if (payload && payload_len > 0) {
+        msg.payload.assign(payload, payload + payload_len);
+    }
+    
+    // Add to system queue with overflow protection
+    {
+        std::lock_guard<std::mutex> lock(system_queue_mutex_);
+        
+        if (system_queue_.size() >= MAX_SYSTEM_QUEUE_SIZE) {
+            // Drop oldest system message (should be rare)
+            NEXUS_WARN("IMPL") << "System queue full, dropping oldest message";
+            system_queue_.pop();
+        }
+        
+        system_queue_.push(std::move(msg));
+    }
+    
+    // Notify system thread
+    system_queue_cv_.notify_one();
+}
+
 NodeImpl::QueueStats NodeImpl::getQueueStats() const {
     QueueStats stats = {};
     
@@ -976,16 +1140,19 @@ void NodeImpl::setQueueOverflowCallback(QueueOverflowCallback callback) {
 }
 
 size_t NodeImpl::cleanupOrphanedChannels() {
-    // Cleanup LargeDataChannel orphaned shared memory
-    size_t cleaned = LargeDataChannel::cleanupOrphanedChannels(60);
+    size_t total_cleaned = 0;
     
-    // Also cleanup SharedMemoryTransportV3 orphaned memory if needed
-    if (shm_transport_v3_) {
-        // V3 has its own cleanup in destructor, but we can force it here
-        // For now, just rely on LargeDataChannel cleanup
+    // 1. Cleanup LargeDataChannel orphaned shared memory
+    size_t channel_cleaned = LargeDataChannel::cleanupOrphanedChannels(CLEANUP_ORPHAN_TIMEOUT_SECONDS);
+    total_cleaned += channel_cleaned;
+    
+    // 2. Cleanup SharedMemoryTransportV3 orphaned node shared memory
+    if (SharedMemoryTransportV3::cleanupOrphanedMemory()) {
+        // cleanupOrphanedMemory returns bool, but logs details internally
+        NEXUS_DEBUG("IMPL") << "Cleaned up orphaned transport memory";
     }
     
-    return cleaned;
+    return total_cleaned;
 }
 
 void NodeImpl::cleanupThreadFunc() {
@@ -993,7 +1160,7 @@ void NodeImpl::cleanupThreadFunc() {
     
     while (cleanup_running_) {
         // Sleep for 5 minutes
-        for (int i = 0; i < 300 && cleanup_running_; ++i) {
+        for (int i = 0; i < CLEANUP_INTERVAL_SECONDS && cleanup_running_; ++i) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         
@@ -1027,9 +1194,10 @@ void NodeImpl::queryRemoteServices() {
         node_id_, "", "", nullptr, 0, 0, MessageType::SERVICE_REGISTER);
     
     shm_transport_v3_->broadcast(query_packet.data(), query_packet.size());
-    
-    // Give other nodes time to respond
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Note: No sleep here - let the receive loop handle incoming service registrations
+    // The test application should wait before starting to send data messages
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 }
 
 void NodeImpl::registerService(const ServiceDescriptor& svc) {
@@ -1067,15 +1235,22 @@ void NodeImpl::unregisterService(const ServiceDescriptor& svc) {
 void NodeImpl::broadcastNodeEvent(bool is_joined) {
     // Broadcast NODE_JOIN or NODE_LEAVE event to other nodes via shared memory
     if (!shm_transport_v3_ || !shm_transport_v3_->isInitialized()) {
+        NEXUS_DEBUG("IMPL") << "Cannot broadcast node event: transport not initialized";
         return;
     }
     
     MessageType msg_type = is_joined ? MessageType::NODE_JOIN : MessageType::NODE_LEAVE;
     
+    NEXUS_DEBUG("IMPL") << "Broadcasting " << (is_joined ? "NODE_JOIN" : "NODE_LEAVE") 
+                        << " event from " << node_id_;
+    
     // Node event message has empty payload (node_id is in message header)
     auto packet = MessageBuilder::build(node_id_, "", "", nullptr, 0, getUdpPort(), msg_type);
     
-    shm_transport_v3_->broadcast(packet.data(), packet.size());
+    int sent_count = shm_transport_v3_->broadcast(packet.data(), packet.size());
+    
+    NEXUS_DEBUG("IMPL") << "Broadcasted " << (is_joined ? "NODE_JOIN" : "NODE_LEAVE")
+                        << " to " << sent_count << " nodes";
 }
 
 void NodeImpl::handleNodeEvent(const std::string& from_node, bool is_joined) {
@@ -1085,14 +1260,28 @@ void NodeImpl::handleNodeEvent(const std::string& from_node, bool is_joined) {
     
     ServiceEvent event = is_joined ? ServiceEvent::NODE_JOINED : ServiceEvent::NODE_LEFT;
     
+    NEXUS_DEBUG("IMPL") << "Node event: " << from_node 
+                        << (is_joined ? " joined" : " left");
+    
     // Notify all listeners in this node
     notifyNodeEvent(event, from_node);
     
     if (is_joined) {
-        // ✅ No need to query new node's services
-        // The new node already sent queryRemoteServices() to discover our services
-        // And future service changes will be auto-broadcasted via subscribe/unsubscribe
-        // This eliminates redundant bidirectional queries
+        // 🔧 FIX: When a new node joins, actively query its services
+        // This triggers lazy connection establishment immediately
+        // Without this, early-started nodes won't connect to late-started nodes
+        // until they passively receive a message (which may take 10+ seconds)
+        NEXUS_DEBUG("IMPL") << "Proactively querying services from new node: " << from_node;
+        
+        // Send a query to the new node (empty SERVICE_REGISTER message)
+        std::vector<uint8_t> query_packet = MessageBuilder::build(
+            node_id_, "", "", nullptr, 0, 0, MessageType::SERVICE_REGISTER);
+        
+        // Send directly to the new node (this will trigger lazy connection)
+        if (shm_transport_v3_) {
+            bool sent = shm_transport_v3_->send(from_node, query_packet.data(), query_packet.size());
+            NEXUS_DEBUG("IMPL") << "Query sent to " << from_node << ": " << (sent ? "SUCCESS" : "FAILED");
+        }
     } else {
         // Node left: Clean up its services from global registry
         // For cross-process nodes, we need to manually clean up services
@@ -1105,6 +1294,12 @@ void NodeImpl::handleNodeEvent(const std::string& from_node, bool is_joined) {
             if (svc.node_id == from_node) {
                 registry.unregisterService(svc.group, svc);
             }
+        }
+        
+        // 🔧 修复: 断开与离开节点的共享内存连接
+        // 当节点重新加入时,需要重新建立连接(新的共享内存地址)
+        if (shm_transport_v3_ && shm_transport_v3_->isInitialized()) {
+            shm_transport_v3_->disconnectFromNode(from_node);
         }
     }
 }
@@ -1176,7 +1371,7 @@ void NodeImpl::broadcastServiceUpdate(const ServiceDescriptor& svc, bool is_add)
     }
 }
 
-void NodeImpl::handleServiceUpdate(const std::string& from_node,
+void NodeImpl::handleServiceUpdate([[maybe_unused]] const std::string& from_node,
                                   const ServiceDescriptor& svc,
                                   bool is_add) {
     // Invoke callback if set
@@ -1237,7 +1432,9 @@ void NodeImpl::handleServiceMessage(const std::string& from_node,
         
         // Reply with each of our services (point-to-point send to requesting node)
         for (const auto& svc : services) {
-            if (svc.node_id == node_id_ && svc.transport == TransportType::SHARED_MEMORY) {
+            // ✅ 修复风险2: 发送所有类型的服务（不只是 SHARED_MEMORY）
+            // 这样即使 SHM 初始化失败，UDP 服务仍能被发现
+            if (svc.node_id == node_id_) {
                 // Serialize service descriptor to payload
                 std::vector<uint8_t> svc_payload;
                 svc_payload.push_back(static_cast<uint8_t>(svc.type));
@@ -1450,7 +1647,7 @@ void NodeImpl::sendUdpHeartbeat() {
     }
 }
 
-void NodeImpl::handleQuerySubscriptions(const std::string& from_node,
+void NodeImpl::handleQuerySubscriptions([[maybe_unused]] const std::string& from_node,
                                        uint16_t from_port,
                                        const std::string& from_addr) {
     // Node is querying our services - reply with all our registered services
@@ -1581,9 +1778,15 @@ void NodeImpl::checkUdpTimeouts() {
 
 // Factory functions
 std::shared_ptr<Node> createNode(const std::string& node_id, TransportMode mode) {
+    // 🔧 生成唯一NodeID: 用户指定的ID + 进程号
+    // 这样即使同一个逻辑节点重启,也会有不同的ID,避免旧连接冲突
+    std::ostringstream oss;
+    oss << node_id << "_" << getpid();
+    std::string unique_node_id = oss.str();
+    
     // Always enable UDP with auto-selected port (0 = auto-select)
     // The framework will automatically choose between in-process and inter-process communication
-    auto node = std::make_shared<NodeImpl>(node_id, true, 0, mode);
+    auto node = std::make_shared<NodeImpl>(unique_node_id, false, 0, mode);
     std::static_pointer_cast<NodeImpl>(node)->initialize(0);
     return node;
 }

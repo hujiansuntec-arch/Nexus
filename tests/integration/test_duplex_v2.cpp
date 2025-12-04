@@ -80,7 +80,7 @@ public:
         node_->subscribe("duplex", {my_topic_}, callback);
         
         std::cout << "[" << node_id_ << "] 等待连接...\n";
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        //std::this_thread::sleep_for(std::chrono::milliseconds(2000));  // Wait for service discovery (4 nodes need more time)
         
         // 准备消息
         std::vector<uint8_t> payload(msg_size_);

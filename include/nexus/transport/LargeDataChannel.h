@@ -189,7 +189,7 @@ public:
         uint64_t capacity;
         
         double usage_percent() const {
-            return capacity > 0 ? (current_usage * 100.0 / capacity) : 0;
+            return capacity > 0 ? (static_cast<double>(current_usage) * 100.0 / static_cast<double>(capacity)) : 0.0;
         }
     };
     

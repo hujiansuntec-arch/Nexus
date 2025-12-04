@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cerrno>     // For errno
 #include <chrono>
+#include <thread>
 #include <signal.h>
 #include <iostream>
 
@@ -66,19 +67,19 @@ bool SharedMemoryRegistry::initialize() {
         return true;
     }
     
-    // Try to open existing registry
-    shm_fd_ = shm_open(REGISTRY_SHM_NAME, O_RDWR, 0666);
-    bool creating = (shm_fd_ < 0);
+    // 🔧 尝试创建新的registry（使用O_EXCL确保原子性）
+    shm_fd_ = shm_open(REGISTRY_SHM_NAME, O_CREAT | O_EXCL | O_RDWR, 0666);
+    bool creating = (shm_fd_ >= 0);
     
-    if (creating) {
-        // Create new registry
-        shm_fd_ = shm_open(REGISTRY_SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (!creating) {
+        // Registry已存在，尝试打开
+        shm_fd_ = shm_open(REGISTRY_SHM_NAME, O_RDWR, 0666);
         if (shm_fd_ < 0) {
-            NEXUS_LOG_ERROR("Registry", "Failed to create registry: " + std::string(strerror(errno)));
+            NEXUS_LOG_ERROR("Registry", "Failed to open registry: " + std::string(strerror(errno)));
             return false;
         }
-        
-        // Set size
+    } else {
+        // 成功创建新registry，设置大小
         if (ftruncate(shm_fd_, sizeof(RegistryRegion)) < 0) {
             NEXUS_LOG_ERROR("Registry", "Failed to set size: " + std::string(strerror(errno)));
             close(shm_fd_);
@@ -103,8 +104,7 @@ bool SharedMemoryRegistry::initialize() {
     registry_ = static_cast<RegistryRegion*>(shm_ptr_);
     
     if (creating) {
-        // Initialize header
-        registry_->header.magic.store(MAGIC);
+        // Initialize header (先初始化其他字段，最后设置magic作为"就绪"标志)
         registry_->header.version.store(VERSION);
         registry_->header.num_entries.store(0);
         registry_->header.capacity.store(MAX_REGISTRY_ENTRIES);
@@ -118,11 +118,28 @@ bool SharedMemoryRegistry::initialize() {
             registry_->entries[i].last_heartbeat.store(0);
         }
         
+        // 🔧 Memory barrier确保所有初始化完成后再设置magic
+        std::atomic_thread_fence(std::memory_order_release);
+        registry_->header.magic.store(MAGIC, std::memory_order_release);
+        
         NEXUS_LOG_INFO("Registry", "Created new registry at " + std::string(REGISTRY_SHM_NAME));
     } else {
-        // Verify existing registry
-        if (registry_->header.magic.load() != MAGIC) {
-            NEXUS_LOG_ERROR("Registry", "Invalid magic number");
+        // 🔧 等待并验证registry初始化完成（最多重试10次，每次10ms）
+        bool valid = false;
+        for (int retry = 0; retry < 10; ++retry) {
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (registry_->header.magic.load(std::memory_order_acquire) == MAGIC) {
+                valid = true;
+                break;
+            }
+            // Registry正在初始化中，等待一小段时间
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        
+        if (!valid) {
+            NEXUS_LOG_ERROR("Registry", "Invalid magic number (got: 0x" + 
+                          std::to_string(registry_->header.magic.load()) + 
+                          ", expected: 0x" + std::to_string(MAGIC) + ")");
             munmap(shm_ptr_, sizeof(RegistryRegion));
             shm_ptr_ = nullptr;
             close(shm_fd_);
@@ -357,22 +374,38 @@ bool SharedMemoryRegistry::cleanupOrphanedRegistry() {
     
     RegistryRegion* reg = static_cast<RegistryRegion*>(ptr);
     
-    // Check if any process is alive
-    bool has_alive = false;
-    for (size_t i = 0; i < MAX_REGISTRY_ENTRIES; ++i) {
-        uint32_t flags = reg->entries[i].flags.load();
-        if ((flags & 0x1) && kill(reg->entries[i].pid, 0) == 0) {
-            has_alive = true;
-            break;
+    // 🔧 修复：检查 magic number，如果有效则说明 registry 正在使用中
+    // 即使暂时没有 entries，也不应该删除（可能正在初始化中）
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (reg->header.magic.load(std::memory_order_acquire) == MAGIC) {
+        // Registry is valid, check if any process is alive
+        bool has_alive = false;
+        for (size_t i = 0; i < MAX_REGISTRY_ENTRIES; ++i) {
+            uint32_t flags = reg->entries[i].flags.load(std::memory_order_acquire);
+            if ((flags & 0x1)) {
+                pid_t pid = reg->entries[i].pid;
+                // 检查进程是否存活
+                if (pid > 0 && kill(pid, 0) == 0) {
+                    has_alive = true;
+                    break;
+                }
+            }
         }
-    }
-    
-    munmap(ptr, sizeof(RegistryRegion));
-    close(fd);
-    
-    if (!has_alive) {
+        
+        munmap(ptr, sizeof(RegistryRegion));
+        close(fd);
+        
+        // 只有在有效的 registry 且没有活动进程时才清理
+        if (!has_alive) {
+            shm_unlink(REGISTRY_SHM_NAME);
+            NEXUS_LOG_INFO("Registry", "Cleaned up orphaned registry");
+        }
+    } else {
+        // Magic number 无效，说明 registry 损坏或未初始化完成，直接删除
+        munmap(ptr, sizeof(RegistryRegion));
+        close(fd);
         shm_unlink(REGISTRY_SHM_NAME);
-        NEXUS_LOG_INFO("Registry", "Cleaned up orphaned registry");
+        NEXUS_LOG_INFO("Registry", "Cleaned up corrupted registry (invalid magic)");
     }
     
     return true;

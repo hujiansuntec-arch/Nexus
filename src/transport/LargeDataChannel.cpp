@@ -18,6 +18,11 @@
 #include <mutex>
 #include <signal.h>  // 用于 kill() 检测进程存活
 
+// ============ LargeDataChannel Constants ============
+#define LARGE_DATA_CLEANUP_INTERVAL_S 30    // Dead reader cleanup interval (seconds)
+#define LARGE_DATA_READER_TIMEOUT_S 60      // Reader heartbeat timeout (seconds)
+#define LARGE_DATA_MIN_VALID_SIZE 4096      // Minimum valid channel size (bytes)
+
 namespace Nexus {
 namespace rpc {
 
@@ -246,8 +251,9 @@ bool LargeDataChannel::initialize() {
         control_->writer_pid.store(getpid(), std::memory_order_release);  // 记录写端PID
         control_->num_readers.store(0, std::memory_order_release);  // 读者数量初始化为0
         control_->capacity = config_.buffer_size;
-        control_->max_block_size = config_.max_block_size;
-        control_->max_readers = config_.max_readers;
+        // Safe cast: config values are validated and fit in uint32_t
+        control_->max_block_size = static_cast<uint32_t>(config_.max_block_size);
+        control_->max_readers = static_cast<uint32_t>(config_.max_readers);
         
         // 初始化所有读者槽位
         for (size_t i = 0; i < MAX_READERS; ++i) {
@@ -346,9 +352,23 @@ int64_t LargeDataChannel::write(const std::string& topic,
     // 检查是否需要环绕
     if (write_offset + total_size > control_->capacity) {
         // 环绕到开头（浪费剩余空间）
-        control_->write_pos.fetch_add(control_->capacity - write_offset);
+        uint64_t skip_size = control_->capacity - write_offset;
+        control_->write_pos.fetch_add(skip_size);
         write_pos = control_->write_pos.load();
         write_offset = 0;
+        
+        // 🔧 关键修复：通知所有读者跳过浪费的空间
+        for (size_t i = 0; i < MAX_READERS; ++i) {
+            if (control_->readers[i].active.load(std::memory_order_acquire)) {
+                uint64_t reader_pos = control_->readers[i].read_pos.load(std::memory_order_acquire);
+                // 如果读者还在旧的环内，需要跳过浪费的空间
+                if (reader_pos < write_pos && (reader_pos % control_->capacity) >= write_offset) {
+                    control_->readers[i].read_pos.store(write_pos, std::memory_order_release);
+                    NEXUS_WARN("LargeData") << "Reader #" << i << " skipped " << skip_size 
+                              << " bytes due to ring wrap (from " << reader_pos << " to " << write_pos << ")";
+                }
+            }
+        }
     }
     
     // 准备头部（先不写magic，避免读端读到未完成数据）
@@ -370,10 +390,9 @@ int64_t LargeDataChannel::write(const std::string& topic,
     std::atomic_thread_fence(std::memory_order_release);
     
     // 最后写入magic作为"发布"标志（发布-订阅模式）
-    header->magic = LargeDataHeader::MAGIC;
-    
-    // 内存屏障：确保magic写入对读端可见
-    std::atomic_thread_fence(std::memory_order_release);
+    // 必须使用atomic store确保跨进程可见性
+    reinterpret_cast<std::atomic<uint32_t>*>(&header->magic)->store(
+        LargeDataHeader::MAGIC, std::memory_order_release);
     
     // 更新写指针（使用release语义）
     control_->write_pos.fetch_add(total_size, std::memory_order_release);
@@ -402,6 +421,17 @@ bool LargeDataChannel::tryRead(DataBlock& block) {
     // 使用acquire语义读取写指针和当前读者的read_pos
     uint64_t read_pos = control_->readers[reader_id_].read_pos.load(std::memory_order_acquire);
     uint64_t write_pos = control_->write_pos.load(std::memory_order_acquire);
+    
+    // 🔧 关键优化：检查read_pos是否指向已被覆盖的数据
+    // 在环形缓冲区中，有效数据范围是 [min_read_pos, write_pos)
+    uint64_t min_read_pos = getMinReadPos();
+    if (read_pos < min_read_pos) {
+        // read_pos指向的数据已被覆盖，跳到当前可读的最早位置
+        control_->readers[reader_id_].read_pos.store(min_read_pos, std::memory_order_release);
+        read_pos = min_read_pos;
+        NEXUS_WARN("LargeData") << "Reader #" << reader_id_ 
+                  << " read_pos was behind, adjusted from 0 to " << min_read_pos;
+    }
     
     // 检查是否有数据
     if (read_pos >= write_pos) {
@@ -472,7 +502,10 @@ LargeDataChannel::ReadResult LargeDataChannel::validateBlock(
     const LargeDataHeader* header, size_t available) const {
     
     // 检查魔数（可能数据还未写完）
-    if (header->magic != LargeDataHeader::MAGIC) {
+    // 必须使用atomic load确保跨进程可见性
+    uint32_t magic = reinterpret_cast<const std::atomic<uint32_t>*>(&header->magic)->load(
+        std::memory_order_acquire);
+    if (magic != LargeDataHeader::MAGIC) {
         return ReadResult::INVALID_MAGIC;
     }
     
@@ -618,8 +651,8 @@ size_t LargeDataChannel::cleanupOrphanedChannels(uint32_t timeout_seconds) {
         bool should_cleanup = false;
         std::string cleanup_reason;
         
-        // 检查是否为有效的LargeDataChannel（至少4KB）
-        if (shm_size >= sizeof(RingBufferControl) + 4096) {
+        // 检查是否为有效的LargeDataChannel
+        if (shm_size >= sizeof(RingBufferControl) + LARGE_DATA_MIN_VALID_SIZE) {
             RingBufferControl* control = static_cast<RingBufferControl*>(addr);
             
             // **优先级1: 引用计数检测**
@@ -727,9 +760,9 @@ int32_t LargeDataChannel::registerReader() {
         if (control_->readers[i].active.compare_exchange_strong(
                 expected, true, std::memory_order_acq_rel)) {
             // 成功占用槽位，初始化
-            control_->readers[i].read_pos.store(
-                control_->write_pos.load(std::memory_order_acquire), 
-                std::memory_order_release);
+            // 🔧 策略：从0开始读取，但在tryRead时会检查并跳过已被覆盖的数据
+            // 这样可以读取注册前已写入的所有数据（如果还在缓冲区中）
+            control_->readers[i].read_pos.store(0, std::memory_order_release);
             control_->readers[i].pid.store(getpid(), std::memory_order_release);
             control_->readers[i].heartbeat.store(
                 static_cast<uint64_t>(time(nullptr)), 
@@ -799,8 +832,8 @@ void LargeDataChannel::cleanupDeadReaders() {
     uint64_t current_time = static_cast<uint64_t>(time(nullptr));
     static uint64_t last_cleanup = 0;
     
-    // 每30秒清理一次
-    if (current_time - last_cleanup < 30) {
+    // 定期清理（每30秒）
+    if (current_time - last_cleanup < LARGE_DATA_CLEANUP_INTERVAL_S) {
         return;
     }
     last_cleanup = current_time;
@@ -827,8 +860,8 @@ void LargeDataChannel::cleanupDeadReaders() {
         // 检查1：进程是否存活
         bool process_dead = !isProcessAlive(pid);
         
-        // 检查2：心跳是否超时（60秒）
-        bool heartbeat_timeout = (current_time - hb) > 60;
+        // 检查2：心跳是否超时
+        bool heartbeat_timeout = (current_time - hb) > LARGE_DATA_READER_TIMEOUT_S;
         
         if (process_dead || heartbeat_timeout) {
             NEXUS_DEBUG("LargeData") << "Cleaning dead reader #" << i 

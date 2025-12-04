@@ -150,12 +150,35 @@ private:
         std::vector<uint8_t> payload;
     };
     
+    // System message processing (SERVICE_REGISTER/UNREGISTER, NODE_JOIN/LEAVE)
+    enum class SystemMessageType {
+        SERVICE_REGISTER,
+        SERVICE_UNREGISTER,
+        NODE_JOIN,
+        NODE_LEAVE
+    };
+    
+    struct SystemMessage {
+        SystemMessageType type;
+        std::string source_node_id;
+        std::string group;
+        std::string topic;
+        std::vector<uint8_t> payload;
+    };
+    
     void messageProcessingThread(size_t thread_id);
+    void systemMessageThread();  // Dedicated thread for system messages
     void enqueueMessage(const std::string& source_node_id,
                        const std::string& group,
                        const std::string& topic,
                        const uint8_t* payload,
                        size_t payload_len);
+    void enqueueSystemMessage(SystemMessageType type,
+                             const std::string& source_node_id,
+                             const std::string& group,
+                             const std::string& topic,
+                             const uint8_t* payload,
+                             size_t payload_len);
     
     // Subscription management
     struct SubscriptionInfo {
@@ -227,6 +250,14 @@ private:
     std::queue<PendingMessage> message_queues_[NUM_PROCESSING_THREADS];  // One queue per thread
     std::vector<std::thread> processing_threads_;
     std::atomic<size_t> dropped_messages_{0};  // Counter for dropped messages due to queue overflow
+    
+    // System message processing (thread-safe, dedicated thread)
+    static constexpr size_t MAX_SYSTEM_QUEUE_SIZE = 1000;  // System messages are rare
+    mutable std::mutex system_queue_mutex_;
+    std::condition_variable system_queue_cv_;
+    std::queue<SystemMessage> system_queue_;
+    std::thread system_thread_;
+    std::atomic<bool> system_running_{false};
     
     // Queue overflow policy
     QueueOverflowPolicy overflow_policy_{QueueOverflowPolicy::DROP_OLDEST};

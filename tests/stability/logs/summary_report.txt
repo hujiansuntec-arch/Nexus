@@ -1,0 +1,247 @@
+╔══════════════════════════════════════════════════════════╗
+║        Long-Term Stability Test - Summary Report        ║
+╚══════════════════════════════════════════════════════════╝
+
+Test Configuration:
+  Number of Processes: 10
+  Test Duration:       20 seconds (0 minutes)
+  Test Completed:      Wed Dec  3 09:33:49 AM CST 2025
+
+════════════════════════════════════════════════════════════
+
+Process 0 Results:
+────────────────────────────────────────────────────────────
+  
+  Test Duration: 23 seconds
+  
+  Overall Statistics:
+    Total Messages Sent:     23162
+    Total Messages Received: 198259
+  
+  Per-Topic Results:
+  ────────────────────────────────────────────────────────────
+  Summary:
+    Loss Rate:       0%
+    Out-of-Order:    0
+    Average Latency: 0 ms
+  
+  ✅ DATA INTEGRITY TEST PASSED!
+  
+  [2025-12-03 09:33:43.057] [INFO ] [IMPL] UDP heartbeat thread stopped for node stability_node_0
+  [2025-12-03 09:33:43.939] [INFO ] [IMPL] Background cleanup thread stopped for node stability_node_0
+  [2025-12-03 09:33:44.836] [INFO ] [Registry] Unregistered node: stability_node_0 (remaining: 9)
+
+Process 1 Results:
+────────────────────────────────────────────────────────────
+  
+  Test Duration: 23 seconds
+  
+  Overall Statistics:
+    Total Messages Sent:     23146
+    Total Messages Received: 200295
+  
+  Per-Topic Results:
+  ────────────────────────────────────────────────────────────
+  Summary:
+    Loss Rate:       0%
+    Out-of-Order:    0
+    Average Latency: 0 ms
+  
+  ✅ DATA INTEGRITY TEST PASSED!
+  
+  [2025-12-03 09:33:43.264] [INFO ] [IMPL] UDP heartbeat thread stopped for node stability_node_1
+  [2025-12-03 09:33:44.144] [INFO ] [IMPL] Background cleanup thread stopped for node stability_node_1
+  [2025-12-03 09:33:45.040] [INFO ] [Registry] Unregistered node: stability_node_1 (remaining: 8)
+
+Process 2 Results:
+────────────────────────────────────────────────────────────
+  
+  Test Duration: 23 seconds
+  
+  Overall Statistics:
+    Total Messages Sent:     23129
+    Total Messages Received: 194791
+  
+  Per-Topic Results:
+  ────────────────────────────────────────────────────────────
+  Summary:
+    Loss Rate:       0%
+    Out-of-Order:    0
+    Average Latency: 0 ms
+  
+  ✅ DATA INTEGRITY TEST PASSED!
+  
+  [2025-12-03 09:33:43.466] [INFO ] [IMPL] UDP heartbeat thread stopped for node stability_node_2
+  [2025-12-03 09:33:44.347] [INFO ] [IMPL] Background cleanup thread stopped for node stability_node_2
+  [2025-12-03 09:33:45.243] [INFO ] [Registry] Unregistered node: stability_node_2 (remaining: 7)
+
+Process 3 Results:
+────────────────────────────────────────────────────────────
+  
+  Test Duration: 23 seconds
+  
+  Overall Statistics:
+    Total Messages Sent:     23128
+    Total Messages Received: 196304
+  
+  Per-Topic Results:
+  ────────────────────────────────────────────────────────────
+  Summary:
+    Loss Rate:       0%
+    Out-of-Order:    0
+    Average Latency: 0 ms
+  
+  ✅ DATA INTEGRITY TEST PASSED!
+  
+  [2025-12-03 09:33:43.671] [INFO ] [IMPL] UDP heartbeat thread stopped for node stability_node_3
+  [2025-12-03 09:33:44.554] [INFO ] [IMPL] Background cleanup thread stopped for node stability_node_3
+  [2025-12-03 09:33:45.448] [INFO ] [Registry] Unregistered node: stability_node_3 (remaining: 6)
+
+Process 4 Results:
+────────────────────────────────────────────────────────────
+  
+  Test Duration: 23 seconds
+  
+  Overall Statistics:
+    Total Messages Sent:     23114
+    Total Messages Received: 183528
+  
+  Per-Topic Results:
+  ────────────────────────────────────────────────────────────
+  Summary:
+    Loss Rate:       0%
+    Out-of-Order:    0
+    Average Latency: 0 ms
+  
+  ✅ DATA INTEGRITY TEST PASSED!
+  
+  [2025-12-03 09:33:43.872] [INFO ] [IMPL] UDP heartbeat thread stopped for node stability_node_4
+  [2025-12-03 09:33:44.754] [INFO ] [IMPL] Background cleanup thread stopped for node stability_node_4
+  [2025-12-03 09:33:45.652] [INFO ] [Registry] Unregistered node: stability_node_4 (remaining: 5)
+
+Process 5 Results:
+────────────────────────────────────────────────────────────
+  
+  Test Duration: 23 seconds
+  
+  Overall Statistics:
+    Total Messages Sent:     23096
+    Total Messages Received: 177355
+  
+  Per-Topic Results:
+  ────────────────────────────────────────────────────────────
+  Summary:
+    Loss Rate:       0%
+    Out-of-Order:    0
+    Average Latency: 0 ms
+  
+  ✅ DATA INTEGRITY TEST PASSED!
+  
+  [2025-12-03 09:33:44.078] [INFO ] [IMPL] UDP heartbeat thread stopped for node stability_node_5
+  [2025-12-03 09:33:44.959] [INFO ] [IMPL] Background cleanup thread stopped for node stability_node_5
+  [2025-12-03 09:33:45.855] [INFO ] [Registry] Unregistered node: stability_node_5 (remaining: 4)
+
+Process 6 Results:
+────────────────────────────────────────────────────────────
+  
+  Test Duration: 23 seconds
+  
+  Overall Statistics:
+    Total Messages Sent:     23082
+    Total Messages Received: 184016
+  
+  Per-Topic Results:
+  ────────────────────────────────────────────────────────────
+  Summary:
+    Loss Rate:       0%
+    Out-of-Order:    0
+    Average Latency: 0 ms
+  
+  ✅ DATA INTEGRITY TEST PASSED!
+  
+  [2025-12-03 09:33:44.285] [INFO ] [IMPL] UDP heartbeat thread stopped for node stability_node_6
+  [2025-12-03 09:33:45.166] [INFO ] [IMPL] Background cleanup thread stopped for node stability_node_6
+  [2025-12-03 09:33:46.059] [INFO ] [Registry] Unregistered node: stability_node_6 (remaining: 3)
+
+Process 7 Results:
+────────────────────────────────────────────────────────────
+  
+  Test Duration: 23 seconds
+  
+  Overall Statistics:
+    Total Messages Sent:     23065
+    Total Messages Received: 164506
+  
+  Per-Topic Results:
+  ────────────────────────────────────────────────────────────
+  Summary:
+    Loss Rate:       0%
+    Out-of-Order:    0
+    Average Latency: 0 ms
+  
+  ✅ DATA INTEGRITY TEST PASSED!
+  
+  [2025-12-03 09:33:44.486] [INFO ] [IMPL] UDP heartbeat thread stopped for node stability_node_7
+  [2025-12-03 09:33:45.368] [INFO ] [IMPL] Background cleanup thread stopped for node stability_node_7
+  [2025-12-03 09:33:46.265] [INFO ] [Registry] Unregistered node: stability_node_7 (remaining: 2)
+
+Process 8 Results:
+────────────────────────────────────────────────────────────
+  
+  Test Duration: 23 seconds
+  
+  Overall Statistics:
+    Total Messages Sent:     23039
+    Total Messages Received: 157767
+  
+  Per-Topic Results:
+  ────────────────────────────────────────────────────────────
+  Summary:
+    Loss Rate:       0%
+    Out-of-Order:    0
+    Average Latency: 0 ms
+  
+  ✅ DATA INTEGRITY TEST PASSED!
+  
+  [2025-12-03 09:33:44.695] [INFO ] [IMPL] UDP heartbeat thread stopped for node stability_node_8
+  [2025-12-03 09:33:45.576] [INFO ] [IMPL] Background cleanup thread stopped for node stability_node_8
+  [2025-12-03 09:33:46.469] [INFO ] [Registry] Unregistered node: stability_node_8 (remaining: 1)
+
+Process 9 Results:
+────────────────────────────────────────────────────────────
+  
+  Test Duration: 23 seconds
+  
+  Overall Statistics:
+    Total Messages Sent:     23050
+    Total Messages Received: 152939
+  
+  Per-Topic Results:
+  ────────────────────────────────────────────────────────────
+  Summary:
+    Loss Rate:       0%
+    Out-of-Order:    0
+    Average Latency: 0 ms
+  
+  ✅ DATA INTEGRITY TEST PASSED!
+  
+  [2025-12-03 09:33:44.899] [INFO ] [IMPL] UDP heartbeat thread stopped for node stability_node_9
+  [2025-12-03 09:33:45.780] [INFO ] [IMPL] Background cleanup thread stopped for node stability_node_9
+  [2025-12-03 09:33:46.675] [INFO ] [Registry] Unregistered node: stability_node_9 (remaining: 0)
+  [2025-12-03 09:33:46.676] [INFO ] [Registry] All nodes exited, cleaning up registry
+  [2025-12-03 09:33:46.676] [INFO ] [Registry] Cleaned up orphaned registry
+
+════════════════════════════════════════════════════════════
+
+Overall Summary:
+  Total Messages Sent (all processes):     231011
+  Total Messages Received (all processes): 1809760
+  Processes Passed:                        10 / 10
+  Processes Failed:                        0 / 10
+
+╔══════════════════════════════════════════════════════════╗
+║  ✅  ALL PROCESSES PASSED - TEST SUCCESSFUL!             ║
+╚══════════════════════════════════════════════════════════╝
+
+Detailed logs available in: /home/fz296w/workspace/Nexus/Nexus/tests/stability/logs/
+

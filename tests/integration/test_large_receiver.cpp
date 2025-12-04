@@ -20,6 +20,7 @@ public:
           received_count_(0),
           total_bytes_(0),
           crc_errors_(0),
+          missed_data_count_(0),
           running_(true) {
         
         // 创建V3节点
@@ -39,11 +40,15 @@ public:
         node_->subscribe("large_data", topics,
             [this](const std::string& group, const std::string& topic,
                    const uint8_t* data, size_t size) {
+                std::cout << "📨 Received notification: group=" << group 
+                          << ", topic=" << topic 
+                          << ", size=" << size << " bytes" << std::endl;
                 this->onDataReady(group, topic, data, size);
             });
         
         std::cout << "Large data receiver initialized: " << node_id << std::endl;
         std::cout << "Using Node::getLargeDataChannel() API" << std::endl;
+        std::cout << "✅ Subscribed to: group=large_data, topic=test/data" << std::endl;
         
         // 记录开始时间
         start_time_ = std::chrono::steady_clock::now();
@@ -72,6 +77,7 @@ public:
                   << "接收次数: " << received_count_ << "\n"
                   << "接收字节: " << formatBytes(total_bytes_) << "\n"
                   << "CRC错误: " << crc_errors_ << "\n"
+                  << "数据丢失: " << missed_data_count_ << " (缓冲区覆盖)\n"
                   << "耗时: " << duration << " ms\n";
         
         if (duration > 0) {
@@ -93,8 +99,12 @@ private:
     void onDataReady(const std::string& group, const std::string& topic,
                      const uint8_t* data, size_t size) {
         // 解析通知
+        // 验证通知消息格式
         if (size != sizeof(Nexus::rpc::LargeDataNotification)) {
-            std::cerr << "Invalid notification size: " << size << std::endl;
+            std::cerr << "Invalid notification size: " << size 
+                      << " bytes, expected: " << sizeof(Nexus::rpc::LargeDataNotification) 
+                      << " bytes" << std::endl;
+            std::cerr << "This may be a test message, not a large data notification" << std::endl;
             return;
         }
         
@@ -103,8 +113,32 @@ private:
         // 从大数据通道读取
         Nexus::rpc::LargeDataChannel::DataBlock block;
         if (!large_channel_->tryRead(block)) {
-            std::cerr << "Failed to read data block, seq: " << notif->sequence << std::endl;
-            return;
+            std::cerr << "Failed to read data block, seq: " << notif->sequence;
+            if (block.result == Nexus::rpc::LargeDataChannel::ReadResult::INVALID_MAGIC) {
+                std::cerr << " (reason: INVALID_MAGIC - data may be overwritten)" << std::endl;
+                missed_data_count_++;
+                
+                // 🔧 关键修复：INVALID_MAGIC可能意味着数据被覆盖
+                // 需要让read_pos前进，否则会永远卡住
+                // 尝试再次读取以触发tryRead()中的read_pos调整逻辑
+                if (!large_channel_->tryRead(block)) {
+                    // 仍然失败，说明数据确实丢失了，放弃这条消息
+                    return;
+                }
+                // 如果第二次成功，继续处理（但数据可能不是notif->sequence对应的）
+            } else if (block.result == Nexus::rpc::LargeDataChannel::ReadResult::INSUFFICIENT) {
+                std::cerr << " (reason: INSUFFICIENT - not enough data)" << std::endl;
+                return;
+            } else if (block.result == Nexus::rpc::LargeDataChannel::ReadResult::SIZE_EXCEEDED) {
+                std::cerr << " (reason: SIZE_EXCEEDED)" << std::endl;
+                return;
+            } else if (block.result == Nexus::rpc::LargeDataChannel::ReadResult::CRC_ERROR) {
+                std::cerr << " (reason: CRC_ERROR)" << std::endl;
+                return;
+            } else {
+                std::cerr << " (reason: unknown)" << std::endl;
+                return;
+            }
         }
         
         // 验证序列号
@@ -129,6 +163,12 @@ private:
         // 更新统计
         received_count_++;
         total_bytes_ += block.size;
+        
+        // 🐌 模拟慢速处理（可通过环境变量SLOW_MODE=1启用）
+        const char* slow_mode = std::getenv("SLOW_MODE");
+        if (slow_mode && std::string(slow_mode) == "1") {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
         
         // 每10次打印一次
         if (received_count_ % 10 == 0) {
@@ -185,6 +225,7 @@ private:
     std::atomic<int> received_count_;
     std::atomic<uint64_t> total_bytes_;
     std::atomic<int> crc_errors_;
+    std::atomic<int> missed_data_count_;  // 被覆盖/丢失的数据计数
     std::atomic<bool> running_;
     
     std::chrono::steady_clock::time_point start_time_;

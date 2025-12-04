@@ -14,7 +14,7 @@ struct Config {
     // Node configuration
     struct NodeConfig {
         size_t max_inbound_queues = 32;      // Maximum inbound queues per node
-        size_t queue_capacity = 256;          // Messages per queue
+        size_t queue_capacity = 1024;         // Messages per queue - increased from 256
         size_t num_processing_threads = 4;   // Thread pool size
         size_t max_queue_size = 25000;       // Max messages per async queue
     } node;
@@ -28,7 +28,7 @@ struct Config {
     
     // Shared memory configuration
     struct SharedMemoryConfig {
-        size_t queue_capacity = 256;         // Queue capacity (64-1024)
+        size_t queue_capacity = 1024;        // Queue capacity (64-1024) - increased from 256
         size_t max_inbound_queues = 64;     // Hard limit (max 64)
         uint32_t heartbeat_interval_ms = 1000;  // 1 second
         uint32_t node_timeout_ms = 5000;        // 5 seconds
