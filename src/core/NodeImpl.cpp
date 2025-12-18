@@ -18,6 +18,10 @@
 namespace Nexus {
 namespace rpc {
 
+// Static member definitions for C++14 compatibility
+constexpr size_t NodeImpl::NUM_PROCESSING_THREADS;
+
+
 // Port range constants for node discovery
 static constexpr uint16_t PORT_BASE = 47200;
 static constexpr uint16_t PORT_MAX = 47999;
@@ -140,16 +144,29 @@ void NodeImpl::initialize(uint16_t udp_port) {
 
                     const MessagePacket* packet = reinterpret_cast<const MessagePacket*>(data);
                     if (!packet->isValid()) {
+                        NEXUS_ERROR("IMPL") << "Received invalid packet";
                         return;
                     }
 
                     std::string source_node(packet->node_id);
+                    NEXUS_INFO("IMPL") << "Received message type " << (int)packet->msg_type << " from " << source_node;
 
                     // Skip our own messages (critical: avoid self-reception)
                     if (source_node == node_id_) {
                         return;
                     }
 
+                    // Use weak_ptr to check if this node is still alive
+                    // This prevents accessing destroyed members if callback runs during destruction
+                    // Note: In this lambda 'this' is captured, but we can't easily get a weak_ptr to 'this'
+                    // without enable_shared_from_this.
+                    // However, shm_transport_v3_ is owned by NodeImpl, so if we are here, NodeImpl should be alive.
+                    // The issue might be in how callbacks are dispatched or if transport outlives NodeImpl.
+                    // But transport is a unique_ptr member, so it dies with NodeImpl.
+                    // The crash "bad_weak_ptr" suggests something is trying to create shared_ptr from this
+                    // when it's already destroying or not managed by shared_ptr.
+                    // GlobalRegistry::registerNode takes a weak_ptr.
+                    // If we call registerNode() in constructor/initialize, we need to be careful.
                     std::string group = packet->group_len > 0 ? std::string(packet->getGroup(), packet->group_len) : "";
                     std::string topic = packet->topic_len > 0 ? std::string(packet->getTopic(), packet->topic_len) : "";
 
@@ -533,26 +550,6 @@ Node::Error NodeImpl::sendLargeData(const std::string& msg_group, const std::str
     }
 
     // Auto-register large data service (first send only)
-    // std::string capability = msg_group + "/" + channel_name + "/" + topic;
-    // {
-    //     std::lock_guard<std::mutex> lock(capabilities_mutex_);
-    //     if (capabilities_.find(capability) == capabilities_.end()) {
-    //         // Register for shared memory (large data only supports SHM)
-    //         if (shm_transport_v3_ && shm_transport_v3_->isInitialized()) {
-    //             ServiceDescriptor svc;
-    //             svc.node_id = node_id_;
-    //             svc.group = msg_group;
-    //             svc.topic = topic;
-    //             svc.type = ServiceType::LARGE_DATA;
-    //             svc.channel_name = channel_name;
-    //             svc.transport = TransportType::SHARED_MEMORY;
-    //             svc.udp_address = "";
-
-    //             registerService(svc);
-    //             capabilities_.insert(capability);
-    //         }
-    //     }
-    // }
 
     // Get or create the large data channel
     auto channel = getLargeDataChannel(channel_name);

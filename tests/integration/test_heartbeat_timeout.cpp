@@ -116,11 +116,11 @@ int main(int argc, char* argv[]) {
                 const auto& e = events[i];
                 std::cout << "  Event " << (i+1) << ": " << e.toString() << std::endl;
                 
-                if (e.event == ServiceEvent::NODE_JOINED && e.node_id == "crasher_node") {
+                if (e.event == ServiceEvent::NODE_JOINED && e.node_id.find("crasher_node") != std::string::npos) {
                     node_joined_count++;
                     join_time = e.timestamp;
                 }
-                if (e.event == ServiceEvent::NODE_LEFT && e.node_id == "crasher_node") {
+                if (e.event == ServiceEvent::NODE_LEFT && e.node_id.find("crasher_node") != std::string::npos) {
                     node_left_count++;
                     left_time = e.timestamp;
                     

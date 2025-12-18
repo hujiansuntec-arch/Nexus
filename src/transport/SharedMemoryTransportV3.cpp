@@ -21,6 +21,17 @@
 #include "nexus/core/NodeImpl.h"  // For handleNodeEvent callback
 #include "nexus/utils/Logger.h"
 
+// Static member definitions for C++14 compatibility
+constexpr size_t Nexus::rpc::SharedMemoryTransportV3::QUEUE_CAPACITY;
+constexpr size_t Nexus::rpc::SharedMemoryTransportV3::MAX_INBOUND_QUEUES;
+constexpr int Nexus::rpc::SharedMemoryTransportV3::NodeHeader::MAX_ACCESSORS;
+constexpr uint32_t Nexus::rpc::SharedMemoryTransportV3::MAGIC;
+constexpr uint32_t Nexus::rpc::SharedMemoryTransportV3::VERSION;
+constexpr uint64_t Nexus::rpc::SharedMemoryTransportV3::HEARTBEAT_INTERVAL_MS;
+constexpr uint64_t Nexus::rpc::SharedMemoryTransportV3::NODE_TIMEOUT_MS;
+constexpr uint64_t Nexus::rpc::SharedMemoryTransportV3::QUEUE_TIMEOUT_MS;
+
+
 // QNX specific includes
 #ifdef __QNXNTO__
 #include <sys/neutrino.h>
@@ -264,7 +275,7 @@ bool SharedMemoryTransportV3::initialize(const std::string& node_id, const Confi
         mechanism_name = "Smart Polling";
     }
 
-    NEXUS_DEBUG("SHM-V3") << "Node " << node_id_ << " initialized"
+    NEXUS_INFO("SHM-V3") << "Node " << node_id_ << " initialized"
                           << "\n  Notify mechanism: " << mechanism_name << "\n  Shared memory: " << my_shm_name_
                           << "\n  Queue capacity: " << config_.queue_capacity
                           << "\n  Max inbound queues: " << MAX_INBOUND_QUEUES;
@@ -1030,7 +1041,7 @@ bool SharedMemoryTransportV3::connectToNode(const std::string& target_node_id) {
 
     remote_connections_[target_node_id] = conn;
 
-    NEXUS_DEBUG("SHM-V3") << "Connected to node: " << target_node_id << " (shm: " << target_info.shm_name << ")";
+    NEXUS_INFO("SHM-V3") << "Connected to node: " << target_node_id << " (shm: " << target_info.shm_name << ")";
 
     return true;
 }
@@ -1187,6 +1198,10 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
         // Use acquire to see queues created by other processes
         uint32_t current_num_queues = my_shm_->header.num_queues.load(std::memory_order_acquire);
 
+        if (current_num_queues != cached_num_queues) {
+             NEXUS_INFO("SHM-V3") << "Num queues changed: " << cached_num_queues << " -> " << current_num_queues;
+        }
+
         // 延长刷新间隔（降低检查频率），但num_queues变化时立即刷新
         bool need_refresh = (current_num_queues != cached_num_queues) ||
                             (queue_refresh_counter >= SHM_QUEUE_REFRESH_INTERVAL) || active_queues.empty();
@@ -1202,6 +1217,7 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
                     uint32_t flags = q.flags.load(std::memory_order_acquire);
                     if ((flags & 0x3) == 0x3) {
                         active_queues.push_back(&q);
+                        NEXUS_INFO("SHM-V3") << "Added active queue " << i;
                     }
                 }
                 cached_num_queues = current_num_queues;
@@ -1262,9 +1278,11 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
                 // 🔧 检查 callback 是否有效（可能在析构时被清空）
                 auto callback = receive_callback_;
                 if (callback) {
-                    NEXUS_DEBUG("SHM-V3")
+                    NEXUS_INFO("SHM-V3")
                         << "[CTRL] Received control message from " << from_node << " (" << msg_size << " bytes)";
                     callback(buffer, msg_size, from_node);
+                } else {
+                    NEXUS_WARN("SHM-V3") << "Callback is null!";
                 }
             }
 

@@ -911,15 +911,6 @@ int SharedMemoryRegistry::findEntryIndex(const std::string& node_id) const {
     return -1;
 }
 
-int SharedMemoryRegistry::findFreeEntryIndex() const {
-    for (size_t i = 0; i < MAX_REGISTRY_ENTRIES; ++i) {
-        // 🔧 Use seq_cst for shared memory visibility
-        if ((registry_->entries[i].flags.load(std::memory_order_seq_cst) & 0x1) == 0) {
-            return static_cast<int>(i);
-        }
-    }
-    return -1;
-}
 
 uint64_t SharedMemoryRegistry::getCurrentTimeMs() const {
     // 🔧 CRITICAL: 使用steady_clock避免NTP时钟回退影响

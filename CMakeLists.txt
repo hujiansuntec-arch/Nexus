@@ -25,6 +25,12 @@ endif()
 option(BUILD_SHARED_LIBS "Build shared libraries" ON)
 option(BUILD_TESTS "Build test programs" ON)
 option(BUILD_EXAMPLES "Build example programs" OFF)
+option(ENABLE_COVERAGE "Enable code coverage generation" OFF)
+
+if(ENABLE_COVERAGE)
+    add_compile_options(--coverage -O0 -g)
+    add_link_options(--coverage)
+endif()
 
 # Include directories
 include_directories(
@@ -150,6 +156,41 @@ if(BUILD_TESTS)
     add_executable(test_polling_overhead tests/stability/test_polling_overhead.cpp)
     target_link_libraries(test_polling_overhead nexus pthread rt)
     
+    # Unit Tests
+    set(UNIT_TEST_SOURCES
+        tests/unit/main.cpp
+        tests/unit/test_lock_free_queue.cpp
+        tests/unit/test_config.cpp
+        tests/unit/test_utils.cpp
+        tests/unit/test_registry.cpp
+        tests/unit/test_transport.cpp
+        tests/unit/test_node.cpp
+        tests/unit/test_large_data_channel.cpp
+        tests/unit/test_transport_errors.cpp
+        tests/unit/test_transport_extended.cpp
+        tests/unit/test_node_extended.cpp
+        tests/unit/test_node_udp.cpp
+        tests/unit/test_node_edge_cases.cpp
+        tests/unit/test_node_self_message.cpp
+        tests/unit/test_coverage_gap.cpp
+        tests/unit/test_transport_coverage.cpp
+        tests/unit/test_transport_stress.cpp
+        tests/unit/test_node_coverage.cpp
+        tests/unit/test_registry_coverage.cpp
+        tests/unit/test_node_impl_coverage.cpp
+        tests/unit/test_transport_v3_coverage.cpp
+        tests/unit/test_node_udp_coverage.cpp
+        tests/unit/test_large_data_cleanup.cpp
+        tests/unit/test_large_data_policies.cpp
+        tests/unit/test_registry_advanced_coverage.cpp
+        tests/unit/test_registry_coverage_extra.cpp
+    )
+
+    add_executable(unit_tests ${UNIT_TEST_SOURCES})
+    target_include_directories(unit_tests PRIVATE tests/unit)
+    target_link_libraries(unit_tests nexus pthread rt)
+    add_test(NAME unit_tests COMMAND unit_tests)
+
     message(STATUS "Test programs will be built")
 endif()
 

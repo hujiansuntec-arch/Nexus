@@ -176,7 +176,7 @@ private:
 
     // Helper methods
     int findEntryIndex(const std::string& node_id) const;
-    int findFreeEntryIndex() const;
+
     uint64_t getCurrentTimeMs() const;
     bool isProcessAlive(pid_t pid) const;
 
