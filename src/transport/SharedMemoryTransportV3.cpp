@@ -7,6 +7,7 @@
 #ifndef __QNXNTO__
 #include <sys/epoll.h>  // 🔧 epoll支持（FIFO模式）
 #endif
+#include <sys/file.h>   // 🔧 For flock()
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -26,7 +27,6 @@
 // Static member definitions for C++14 compatibility
 constexpr size_t Nexus::rpc::SharedMemoryTransportV3::QUEUE_CAPACITY;
 constexpr size_t Nexus::rpc::SharedMemoryTransportV3::MAX_INBOUND_QUEUES;
-constexpr int Nexus::rpc::SharedMemoryTransportV3::NodeHeader::MAX_ACCESSORS;
 constexpr uint32_t Nexus::rpc::SharedMemoryTransportV3::MAGIC;
 constexpr uint32_t Nexus::rpc::SharedMemoryTransportV3::VERSION;
 constexpr uint64_t Nexus::rpc::SharedMemoryTransportV3::HEARTBEAT_INTERVAL_MS;
@@ -133,27 +133,6 @@ SharedMemoryTransportV3::~SharedMemoryTransportV3() {
         remote_connections_.clear();
     }
 
-    // CRITICAL: Remove my PID from all remote nodes' accessor lists
-    // Do this BEFORE munmap to ensure atomic visibility
-    pid_t my_pid = getpid();
-    for (const auto& res : resources_to_cleanup) {
-        if (res.first && res.first != MAP_FAILED) {
-            NodeSharedMemory* remote_shm = static_cast<NodeSharedMemory*>(res.first);
-
-            // Remove my PID from accessor list
-            for (int i = 0; i < NodeHeader::MAX_ACCESSORS; ++i) {
-                int32_t expected = static_cast<int32_t>(my_pid);
-                if (remote_shm->header.accessor_pids[i].compare_exchange_strong(expected, 0, std::memory_order_acq_rel,
-                                                                                std::memory_order_acquire)) {
-                    remote_shm->header.num_accessors.fetch_sub(1, std::memory_order_release);
-                    NEXUS_DEBUG("SHM-V3")
-                        << "Removed PID " << my_pid << " from remote node accessor list (slot " << i << ")";
-                    break;
-                }
-            }
-        }
-    }
-
     // Now safe to munmap and close
     for (const auto& res : resources_to_cleanup) {
         if (res.first && res.first != MAP_FAILED) {
@@ -165,17 +144,8 @@ SharedMemoryTransportV3::~SharedMemoryTransportV3() {
     }
     NEXUS_DEBUG("SHM-V3") << "Disconnected from all remote nodes";
 
-    // 移除自己的 accessor PID
     NEXUS_DEBUG("SHM-V3") << "Destructor: my_shm_=" << (void*)my_shm_ << ", my_shm_ptr_=" << (void*)my_shm_ptr_
                           << ", initialized_=" << initialized_;
-
-    if (my_shm_ && my_shm_ptr_ && my_shm_ptr_ != MAP_FAILED) {
-        removeAccessor(getpid());
-        NEXUS_INFO("SHM-V3") << "Removed accessor PID " << getpid() << " from node " << node_id_;
-    } else {
-        NEXUS_WARN("SHM-V3") << "Cannot remove accessor PID from node " << node_id_ << ": "
-                             << "my_shm_=" << (void*)my_shm_ << ", my_shm_ptr_=" << (void*)my_shm_ptr_;
-    }
 
     // Unregister from registry FIRST (prevents new connections)
     if (initialized_) {
@@ -184,36 +154,41 @@ SharedMemoryTransportV3::~SharedMemoryTransportV3() {
     }
 
     // Strategy: Delayed cleanup after grace period
-    // 1. Remove accessor PID (already done above)
-    // 2. Sleep briefly to let other nodes detect and disconnect
-    // 3. Then unlink - safe because:
+    // 1. Sleep briefly to let other nodes detect and disconnect
+    // 2. Then unlink - safe because:
     //    - Not in registry anymore (no new connections)
     //    - Other nodes had time to disconnect
     //    - Existing mmaps continue to work
 
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-    bool has_unlink = false;
-    // Now safe to unlink: not in registry, grace period passed
-    if (my_shm_ && my_shm_name_.size() > 0) {
-        if (!hasActiveAccessors(&my_shm_->header)) {
-            has_unlink = true;
-        }
-    }
     if (my_shm_ptr_ && my_shm_ptr_ != MAP_FAILED) {
         munmap(my_shm_ptr_, sizeof(NodeSharedMemory));
         my_shm_ptr_ = nullptr;
         my_shm_ = nullptr;
     }
     if (my_shm_fd_ >= 0) {
+        // Release our shared lock
         close(my_shm_fd_);
         my_shm_fd_ = -1;
     }
-    if (has_unlink) {
-        if (shm_unlink(my_shm_name_.c_str()) == 0) {
-            NEXUS_DEBUG("SHM-V3") << "Unlinked shared memory: " << my_shm_name_;
-        } else {
-            NEXUS_WARN("SHM-V3") << "Failed to unlink " << my_shm_name_ << ": " << strerror(errno);
+
+    // 🔧 CRITICAL: Use file locking to safely unlink
+    // Only unlink if we can acquire an exclusive lock, which means
+    // no other processes are currently attached (holding shared locks).
+    if (my_shm_name_.size() > 0) {
+        int fd = shm_open(my_shm_name_.c_str(), O_RDWR, 0666);
+        if (fd >= 0) {
+            // Try to acquire exclusive lock (non-blocking)
+            if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+                if (shm_unlink(my_shm_name_.c_str()) == 0) {
+                    NEXUS_DEBUG("SHM-V3") << "Unlinked shared memory: " << my_shm_name_;
+                }
+                flock(fd, LOCK_UN);
+            } else {
+                NEXUS_DEBUG("SHM-V3") << "Shared memory still in use by others, not unlinking: " << my_shm_name_;
+            }
+            close(fd);
         }
     }
 
@@ -646,26 +621,10 @@ SharedMemoryTransportV3::TransportStats SharedMemoryTransportV3::getStats() cons
 }
 
 bool SharedMemoryTransportV3::cleanupOrphanedMemory() {
-    NEXUS_DEBUG("SHM-V3") << "Cleaning up orphaned shared memory...";
+    NEXUS_DEBUG("SHM-V3") << "Cleaning up orphaned shared memory (using file locks)...";
 
     size_t cleaned_count = 0;
     size_t total_freed = 0;
-
-    // 辅助函数：检查进程是否存活
-    auto isProcessAlive = [](int32_t pid) -> bool {
-        if (pid <= 0) {
-            return false;  // 无效PID
-        }
-
-        // kill(pid, 0) 不发送信号，只检查进程是否存在
-        if (kill(pid, 0) == 0) {
-            return true;  // 进程存在且有权限访问
-        }
-
-        // ESRCH: 进程不存在
-        // EPERM: 进程存在但无权限（也算存活）
-        return errno != ESRCH;
-    };
 
 // 扫描共享内存目录，查找librpc_node_*文件
 // QNX uses /dev/shmem instead of /dev/shm
@@ -697,68 +656,42 @@ bool SharedMemoryTransportV3::cleanupOrphanedMemory() {
             continue;
         }
 
-        // 获取文件大小
+        // 获取文件大小和时间信息
         struct stat st;
         if (fstat(fd, &st) != 0) {
             close(fd);
             continue;
         }
 
-        size_t shm_size = st.st_size;
-
-        // 映射共享内存以检查header
-        void* addr = mmap(nullptr, sizeof(NodeHeader), PROT_READ, MAP_SHARED, fd, 0);
-        if (addr == MAP_FAILED) {
+        // 🛡️ 竞态保护：跳过最近创建/修改的文件
+        // 防止误删正在启动但尚未加锁的新节点共享内存
+        // 给予 3 秒的宽限期，足以覆盖 shm_open 到 flock 之间的间隙
+        time_t now = time(nullptr);
+        // 注意：如果系统时间回调(NTP)，now 可能小于 st_mtime，此时也应跳过
+        if (now < st.st_mtime || (now - st.st_mtime < 3)) {
+            // 文件太新（或来自未来），跳过
             close(fd);
             continue;
         }
 
-        bool should_cleanup = false;
-        std::string cleanup_reason;
-
-        // 检查是否为有效的V3节点共享内存
-        NodeHeader* header = static_cast<NodeHeader*>(addr);
-
-        // Use acquire when reading remote process shared memory
-        if (header->magic.load(std::memory_order_acquire) == MAGIC) {
-            int32_t owner_pid = header->owner_pid.load(std::memory_order_acquire);
-
-            // CRITICAL: Check if ALL accessors are dead using helper function
-            // This is the safest cleanup condition
-            bool owner_dead = (owner_pid > 0 && !isProcessAlive(owner_pid));
-            bool has_active = hasActiveAccessors(header);
-
-            // Cleanup conditions (ALL must be true):
-            // 1. Owner is dead
-            // 2. NO active accessor processes (no one has it mapped)
-            if (owner_dead && !has_active) {
-                uint32_t num_accessors = header->num_accessors.load(std::memory_order_acquire);
-                should_cleanup = true;
-                cleanup_reason = "owner and all " + std::to_string(num_accessors) + " accessor(s) dead";
-            } else if (owner_dead && has_active) {
-                // Owner dead but accessors still alive - don't cleanup yet
-                uint32_t num_accessors = header->num_accessors.load(std::memory_order_acquire);
-                NEXUS_DEBUG("SHM-V3") << "Skipping " << name << ": " << num_accessors << " accessor(s) still alive";
-            }
-        } else {
-            // 不是有效的V3共享内存，可能是残留文件
-            should_cleanup = true;
-            cleanup_reason = "invalid magic number";
-        }
-
-        munmap(addr, sizeof(NodeHeader));
-        close(fd);
-
-        if (should_cleanup) {
+        // 🔒 核心修复：尝试获取排他锁
+        // 如果能获取到排他锁，说明没有任何进程持有共享锁（即没有进程在使用该节点）
+        // LOCK_NB 确保不阻塞
+        if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+            // 成功获取排他锁，说明是僵尸文件，可以安全删除
             if (shm_unlink(full_name.c_str()) == 0) {
                 cleaned_count++;
-                total_freed += shm_size;
-                NEXUS_DEBUG("SHM-V3") << "✓ Cleaned: " << name << " (" << (shm_size / 1024 / 1024) << " MB) - "
-                                      << cleanup_reason;
+                total_freed += st.st_size;
+                NEXUS_DEBUG("SHM-V3") << "✓ Cleaned orphaned node memory: " << name;
             } else {
                 NEXUS_ERROR("SHM-V3") << "✗ Failed to unlink " << name << ": " << strerror(errno);
             }
+
+            // 解锁
+            flock(fd, LOCK_UN);
         }
+
+        close(fd);
     }
 
     closedir(dir);
@@ -803,6 +736,16 @@ bool SharedMemoryTransportV3::createMySharedMemory() {
         }
     }
 
+    // 🔒 核心修复：获取共享锁，标记该节点正在运行
+    // 当进程崩溃时，操作系统会自动释放该锁
+    if (flock(my_shm_fd_, LOCK_SH) < 0) {
+        NEXUS_ERROR("SHM-V3") << "Failed to lock shared memory: " << strerror(errno);
+        close(my_shm_fd_);
+        my_shm_fd_ = -1;
+        shm_unlink(my_shm_name_.c_str());
+        return false;
+    }
+
     // Set size
     size_t shm_size = sizeof(NodeSharedMemory);
     if (ftruncate(my_shm_fd_, shm_size) < 0) {
@@ -843,12 +786,6 @@ bool SharedMemoryTransportV3::createMySharedMemory() {
         std::memory_order_relaxed);
     my_shm_->header.ready.store(false, std::memory_order_relaxed);
     my_shm_->header.owner_pid.store(getpid(), std::memory_order_relaxed);
-
-    // CRITICAL: Initialize accessor tracking
-    my_shm_->header.num_accessors.store(0, std::memory_order_relaxed);
-    for (int i = 0; i < NodeHeader::MAX_ACCESSORS; ++i) {
-        my_shm_->header.accessor_pids[i].store(0, std::memory_order_relaxed);
-    }
 
     // 🔧 初始化全局共享的pthread对象（所有队列共享同一个cond_var）
     pthread_mutexattr_t mattr;
@@ -952,6 +889,14 @@ bool SharedMemoryTransportV3::connectToNode(const std::string& target_node_id) {
         return false;
     }
 
+    // 🔒 核心修复：获取共享锁，标记正在使用该节点
+    // 防止在连接期间被清理
+    if (flock(conn.shm_fd, LOCK_SH) < 0) {
+        NEXUS_ERROR("SHM-V3") << "Failed to lock remote shm: " << strerror(errno);
+        close(conn.shm_fd);
+        return false;
+    }
+
 // Map remote memory
 // Note: MAP_NORESERVE may not be supported on QNX, use MAP_SHARED only
 #ifdef __QNXNTO__
@@ -988,6 +933,16 @@ bool SharedMemoryTransportV3::connectToNode(const std::string& target_node_id) {
     }
 
     // 健康检查: 验证进程是否存活
+    // 1. 检查 Registry 中的 PID (更可靠，因为是在注册时写入的)
+    if (target_info.pid > 0 && kill(target_info.pid, 0) != 0) {
+        NEXUS_WARN("SHM-V3") << "Registry says node process is dead (pid=" << target_info.pid
+                             << "), skipping connection to: " << target_node_id;
+        munmap(conn.shm_ptr, sizeof(NodeSharedMemory));
+        close(conn.shm_fd);
+        return false;
+    }
+
+    // 2. 检查 SHM Header 中的 PID
     // 注意：kill(pid, 0) 可能因权限问题失败，所以要谨慎处理
     pid_t owner_pid = remote_shm->header.owner_pid.load(std::memory_order_acquire);
     if (owner_pid > 0 && kill(owner_pid, 0) != 0) {
@@ -1001,42 +956,10 @@ bool SharedMemoryTransportV3::connectToNode(const std::string& target_node_id) {
         return false;
     }
 
-    // CRITICAL: Add my PID to target node's accessor list
-    // This tracks that I have opened and mapped this shared memory
-    pid_t my_pid = getpid();
-    bool added = false;
-    for (int i = 0; i < NodeHeader::MAX_ACCESSORS; ++i) {
-        int32_t expected = 0;
-        if (remote_shm->header.accessor_pids[i].compare_exchange_strong(
-                expected, static_cast<int32_t>(my_pid), std::memory_order_acq_rel, std::memory_order_acquire)) {
-            remote_shm->header.num_accessors.fetch_add(1, std::memory_order_release);
-            added = true;
-            NEXUS_DEBUG("SHM-V3") << "Added PID " << my_pid << " to " << target_node_id << " accessor list (slot " << i
-                                  << ")";
-            break;
-        }
-    }
-
-    if (!added) {
-        NEXUS_WARN("SHM-V3") << "Accessor list full for " << target_node_id << ", connection may be unsafe to cleanup";
-    }
-
     // Find or create queue for me in target node's memory
     conn.my_queue = findOrCreateQueue(remote_shm, node_id_);
     if (!conn.my_queue) {
         NEXUS_ERROR("SHM-V3") << "Failed to create queue in remote node";
-
-        // Remove my PID if queue allocation failed
-        if (added) {
-            for (int i = 0; i < NodeHeader::MAX_ACCESSORS; ++i) {
-                int32_t expected = static_cast<int32_t>(my_pid);
-                if (remote_shm->header.accessor_pids[i].compare_exchange_strong(expected, 0,
-                                                                                std::memory_order_acq_rel)) {
-                    remote_shm->header.num_accessors.fetch_sub(1, std::memory_order_release);
-                    break;
-                }
-            }
-        }
 
         munmap(conn.shm_ptr, sizeof(NodeSharedMemory));
         close(conn.shm_fd);
@@ -1062,11 +985,7 @@ void SharedMemoryTransportV3::disconnectFromNode(const std::string& target_node_
 
     RemoteConnection& conn = it->second;
 
-    // Remove our PID from the remote node's accessor list before disconnecting
     if (conn.shm_ptr && conn.shm_ptr != MAP_FAILED) {
-        NodeSharedMemory* remote_shm = static_cast<NodeSharedMemory*>(conn.shm_ptr);
-        removeAccessorFromNode(&remote_shm->header, getpid());
-
         munmap(conn.shm_ptr, sizeof(NodeSharedMemory));
     }
 
@@ -1626,41 +1545,33 @@ void SharedMemoryTransportV3::heartbeatLoop() {
             }
         }
 
-        // Get nodes before cleanup (for detecting removed nodes)
-        std::vector<NodeInfo> nodes_before;
-        if (node_impl_) {
-            nodes_before = registry_.getAllNodes();
-        }
-
         // Clean up stale nodes from registry
-        int cleaned = registry_.cleanupStaleNodes(NODE_TIMEOUT_MS);
+        registry_.cleanupStaleNodes(NODE_TIMEOUT_MS);
 
-        // Notify NodeImpl about removed nodes (trigger NODE_LEFT events)
-        if (cleaned > 0 && node_impl_) {
-            auto nodes_after = registry_.getAllNodes();
+        // 🔧 CRITICAL FIX: Reconcile active connections with registry
+        // We must check if any connected nodes are missing from the registry,
+        // regardless of who cleaned them up (us or another process).
+        if (node_impl_) {
+            auto current_nodes = registry_.getAllNodes();
+            std::set<std::string> registry_node_ids;
+            for (const auto& node : current_nodes) {
+                registry_node_ids.insert(node.node_id);
+            }
 
-            // Find which nodes were removed
-            for (const auto& node : nodes_before) {
-                // Skip self
-                if (node.node_id == node_id_) {
-                    continue;
-                }
-
-                // Check if node still exists
-                bool found = false;
-                for (const auto& n : nodes_after) {
-                    if (n.node_id == node.node_id) {
-                        found = true;
-                        break;
+            std::vector<std::string> dead_nodes;
+            {
+                std::lock_guard<std::mutex> lock(connections_mutex_);
+                for (const auto& pair : remote_connections_) {
+                    // If connected node is NOT in registry, it's dead
+                    if (registry_node_ids.find(pair.first) == registry_node_ids.end()) {
+                        dead_nodes.push_back(pair.first);
                     }
                 }
+            }
 
-                // Node was removed - trigger NODE_LEFT event
-                if (!found) {
-                    NEXUS_DEBUG("SHM-V3")
-                        << "Heartbeat timeout detected for node: " << node.node_id << ", triggering NODE_LEFT event";
-                    node_impl_->handleNodeEvent(node.node_id, false);
-                }
+            for (const auto& nid : dead_nodes) {
+                NEXUS_INFO("SHM-V3") << "Node " << nid << " missing from registry, triggering cleanup";
+                node_impl_->handleNodeEvent(nid, false);
             }
         }
 
@@ -1698,102 +1609,6 @@ std::string SharedMemoryTransportV3::generateShmName() {
     oss << "/librpc_node_" << getpid() << "_" << std::hex << std::setfill('0') << std::setw(8)
         << (std::hash<std::string>{}(node_id_)&0xFFFFFFFF);
     return oss.str();
-}
-
-// Add accessor PID to our own node header
-void SharedMemoryTransportV3::addAccessor(pid_t pid) {
-    if (!my_shm_) {
-        return;
-    }
-    addAccessorToNode(&my_shm_->header, pid);
-}
-
-// Remove accessor PID from our own node header
-void SharedMemoryTransportV3::removeAccessor(pid_t pid) {
-    if (!my_shm_) {
-        return;
-    }
-    removeAccessorFromNode(&my_shm_->header, pid);
-}
-
-// Add accessor PID to any node header (thread-safe)
-void SharedMemoryTransportV3::addAccessorToNode(NodeHeader* header, pid_t pid) {
-    if (!header || pid <= 0) {
-        return;
-    }
-
-    // Try to find an empty slot or existing entry
-    for (uint32_t i = 0; i < NodeHeader::MAX_ACCESSORS; ++i) {
-        int32_t expected = 0;
-        // Try to claim an empty slot
-        if (header->accessor_pids[i].compare_exchange_strong(expected, pid, std::memory_order_release,
-                                                             std::memory_order_relaxed)) {
-            header->num_accessors.fetch_add(1, std::memory_order_release);
-            NEXUS_DEBUG("SHM-V3") << "Added accessor PID " << pid << " to node (count=" << header->num_accessors.load()
-                                  << ")";
-            return;
-        }
-        // Already exists
-        if (expected == pid) {
-            return;
-        }
-    }
-    NEXUS_WARN("SHM-V3") << "Failed to add accessor PID " << pid
-                         << ": accessor array full (MAX_ACCESSORS=" << NodeHeader::MAX_ACCESSORS << ")";
-}
-
-// Remove accessor PID from any node header (thread-safe)
-void SharedMemoryTransportV3::removeAccessorFromNode(NodeHeader* header, pid_t pid) {
-    if (!header || pid <= 0) {
-        return;
-    }
-
-    // Find and remove the PID
-    for (uint32_t i = 0; i < NodeHeader::MAX_ACCESSORS; ++i) {
-        int32_t expected = pid;
-        if (header->accessor_pids[i].compare_exchange_strong(expected, 0, std::memory_order_release,
-                                                             std::memory_order_relaxed)) {
-            header->num_accessors.fetch_sub(1, std::memory_order_release);
-            NEXUS_DEBUG("SHM-V3") << "Removed accessor PID " << pid
-                                  << " from node (count=" << header->num_accessors.load() << ")";
-            return;
-        }
-    }
-
-    NEXUS_DEBUG("SHM-V3") << "Accessor PID " << pid << " not found in node header";
-}
-
-// Check if any accessor PIDs are still alive
-bool SharedMemoryTransportV3::hasActiveAccessors(NodeHeader* header) {
-    if (!header) {
-        return false;
-    }
-
-    uint32_t count = header->num_accessors.load(std::memory_order_acquire);
-    if (count == 0) {
-        return false;
-    }
-
-    // Verify each accessor PID is actually alive
-    bool has_active = false;
-    for (uint32_t i = 0; i < NodeHeader::MAX_ACCESSORS; ++i) {
-        pid_t pid = header->accessor_pids[i].load(std::memory_order_acquire);
-        if (pid > 0) {
-            // Check if process is alive
-            if (kill(pid, 0) == 0) {
-                has_active = true;
-            } else {
-                // Dead process, remove it
-                int32_t expected = pid;
-                if (header->accessor_pids[i].compare_exchange_strong(expected, 0, std::memory_order_release,
-                                                                     std::memory_order_relaxed)) {
-                    header->num_accessors.fetch_sub(1, std::memory_order_release);
-                    NEXUS_DEBUG("SHM-V3") << "Removed dead accessor PID " << pid;
-                }
-            }
-        }
-    }
-    return has_active;
 }
 
 }  // namespace rpc

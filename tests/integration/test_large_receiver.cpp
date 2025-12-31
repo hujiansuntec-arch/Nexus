@@ -4,6 +4,7 @@
 
 #include "nexus/core/Node.h"
 #include "nexus/transport/LargeDataChannel.h"
+#include "nexus/transport/SharedMemoryTransportV3.h"
 #include <iostream>
 #include <atomic>
 #include <chrono>
@@ -23,6 +24,10 @@ public:
           missed_data_count_(0),
           running_(true) {
         
+        // 启动前清理残留的共享内存
+        // 使用新的基于文件锁的清理机制，安全地清理僵尸文件
+        Nexus::rpc::SharedMemoryTransportV3::cleanupOrphanedMemory();
+
         // 创建V3节点
         node_ = Nexus::rpc::createNode(node_id);
         if (!node_) {

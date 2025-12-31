@@ -93,7 +93,13 @@ TEST(TransportV3AdvancedTest, CleanupOrphaned) {
     auto* shm = static_cast<Nexus::rpc::SharedMemoryTransportV3::NodeSharedMemory*>(addr);
     shm->header.magic.store(Nexus::rpc::SharedMemoryTransportV3::MAGIC);
     shm->header.owner_pid.store(999999); // Dead PID
-    shm->header.num_accessors.store(0);
+    
+    // Set modification time to 10 seconds ago to bypass grace period
+    struct timespec times[2];
+    clock_gettime(CLOCK_REALTIME, &times[0]);
+    times[1] = times[0];
+    times[1].tv_sec -= 10;
+    futimens(fd, times);
     
     munmap(addr, size);
     close(fd);

@@ -166,6 +166,7 @@ if(BUILD_TESTS)
         tests/unit/test_transport.cpp
         tests/unit/test_node.cpp
         tests/unit/test_large_data_channel.cpp
+        tests/unit/test_large_data_zero_copy.cpp
         tests/unit/test_transport_errors.cpp
         tests/unit/test_transport_extended.cpp
         tests/unit/test_node_extended.cpp

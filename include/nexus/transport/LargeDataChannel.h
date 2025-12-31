@@ -108,6 +108,7 @@ public:
         size_t max_block_size;                        // 单个数据块最大大小（默认8MB）
         size_t max_readers;                           // 最大读者数量（默认8）
         bool use_mmap_noreserve;                      // 使用MAP_NORESERVE优化
+        bool enable_crc32;                            // 是否启用CRC32校验（默认true）
         LargeDataOverflowPolicy overflow_policy;      // 溢出策略（默认DROP_OLDEST）
         LargeDataOverflowCallback overflow_callback;  // 溢出回调
 
@@ -116,6 +117,7 @@ public:
               max_block_size(8 * 1024 * 1024),
               max_readers(8),
               use_mmap_noreserve(true),
+              enable_crc32(true),
               overflow_policy(LargeDataOverflowPolicy::DROP_OLDEST),
               overflow_callback(nullptr) {}
     };
@@ -128,6 +130,18 @@ public:
         INVALID_MAGIC,  // Magic不匹配（可能数据未写完）
         SIZE_EXCEEDED,  // 数据大小超限
         INSUFFICIENT    // 数据不完整
+    };
+
+    // 可写数据块句柄（零拷贝写入）
+    struct WritableBlock {
+        uint8_t* data;          // 数据写入地址
+        size_t size;            // 数据大小
+        uint64_t write_offset;  // 内部使用的写入偏移量
+        uint64_t sequence;      // 预分配的序列号
+
+        WritableBlock() : data(nullptr), size(0), write_offset(0), sequence(0) {}
+
+        bool isValid() const { return data != nullptr; }
     };
 
     // 数据块句柄（零拷贝访问）
@@ -173,6 +187,17 @@ public:
     // 写入大数据（返回序列号，-1表示失败）
     // 注意：data会被直接写入共享内存，调用者可以在返回后释放原始data
     int64_t write(const std::string& topic, const uint8_t* data, size_t size);
+
+    // 零拷贝写入接口：分配写入空间
+    // 返回WritableBlock，用户直接向block.data写入数据
+    // 写入完成后必须调用commitWrite
+    WritableBlock allocWrite(size_t size);
+
+    // 零拷贝写入接口：提交写入
+    // @param block allocWrite返回的block
+    // @param topic 主题名称
+    // @return 序列号，-1表示失败
+    int64_t commitWrite(const WritableBlock& block, const std::string& topic);
 
     // 尝试读取一个数据块（非阻塞）
     // 返回的DataBlock指向共享内存，读取完后必须调用releaseBlock

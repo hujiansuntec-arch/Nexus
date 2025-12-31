@@ -29,23 +29,28 @@ TEST(LargeDataPolicies, DropOldest) {
     
     std::vector<uint8_t> data(1024, 0xAA);
     
-    // Fill buffer
+    // Fill buffer and overflow
     // Capacity is 40960. Each write is ~1100 bytes.
-    // 40 writes should fill it.
+    // 50 writes should definitely overflow.
     int writes = 0;
     for (int i = 0; i < 50; ++i) {
-        if (channel->write("topic", data.data(), data.size()) == -1) {
-            break;
-        }
+        int64_t seq = channel->write("topic", data.data(), data.size());
+        ASSERT_NE(seq, -1); // Should always succeed with DROP_OLDEST
         writes++;
     }
     
-    // Should have stopped before 50
-    ASSERT_LT(writes, 50);
-
-    // The next write should fail because DROP_OLDEST is not supported
-    int64_t result = channel->write("topic", data.data(), data.size());
-    ASSERT_EQ(result, -1);
+    // Reader should have missed data
+    // Try to read. The first block should have a sequence number > 0
+    bool has_data = reader->tryRead(block);
+    ASSERT_TRUE(has_data);
+    ASSERT_TRUE(block.isValid());
+    
+    // Since we wrote 50 blocks, and buffer holds ~30, we must have dropped ~20.
+    // So the first available block should be around sequence 20.
+    std::cout << "First read sequence: " << block.header->sequence << std::endl;
+    ASSERT_GT(block.header->sequence, 0);
+    
+    reader->releaseBlock(block);
 }
 
 TEST(LargeDataPolicies, Block) {

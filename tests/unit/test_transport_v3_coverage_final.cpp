@@ -24,10 +24,6 @@ struct alignas(64) MockNodeHeader {
     std::atomic<bool> ready;
     std::atomic<int32_t> owner_pid;
 
-    static constexpr int MAX_ACCESSORS = 64;
-    std::atomic<int32_t> accessor_pids[MAX_ACCESSORS];
-    std::atomic<uint32_t> num_accessors;
-
     pthread_mutex_t global_mutex;
     pthread_cond_t global_cond;
 
@@ -130,84 +126,6 @@ TEST(TransportV3CoverageFinal, ReceiveCallbackNull) {
     
     sender.stopReceiving();
     transport.stopReceiving();
-    
-    cleanup_shm();
-}
-
-TEST(TransportV3CoverageFinal, AccessorListFull) {
-    cleanup_shm();
-    
-    int fd = shm_open("/librpc_node_accessor_test", O_CREAT | O_RDWR, 0666);
-    ASSERT_TRUE(fd != -1);
-    ftruncate(fd, 50 * 1024 * 1024);
-    
-    void* ptr = mmap(nullptr, 50 * 1024 * 1024, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    ASSERT_TRUE(ptr != MAP_FAILED);
-    
-    MockNodeHeader* header = (MockNodeHeader*)ptr;
-    new (header) MockNodeHeader();
-    header->magic.store(0x4C524E33);
-    header->version.store(1);
-    header->ready.store(true);
-    header->owner_pid.store(getpid());
-    header->num_accessors.store(64); 
-    for (int i = 0; i < 64; i++) {
-        header->accessor_pids[i].store(10000 + i);
-    }
-    
-    pthread_mutexattr_t mattr;
-    pthread_mutexattr_init(&mattr);
-    pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED);
-    pthread_mutex_init(&header->global_mutex, &mattr);
-    pthread_mutexattr_destroy(&mattr);
-
-    pthread_condattr_t cattr;
-    pthread_condattr_init(&cattr);
-    pthread_condattr_setpshared(&cattr, PTHREAD_PROCESS_SHARED);
-    pthread_cond_init(&header->global_cond, &cattr);
-    pthread_condattr_destroy(&cattr);
-
-    munmap(ptr, 50 * 1024 * 1024);
-    close(fd);
-    
-    SharedMemoryRegistry registry;
-    registry.registerNode("full_node", "/librpc_node_accessor_test");
-    
-    SharedMemoryTransportV3 transport;
-    ASSERT_TRUE(transport.initialize("accessor_tester"));
-    
-    uint8_t data[] = "test";
-    bool sent = transport.send("full_node", data, sizeof(data));
-    
-    cleanup_shm();
-}
-
-TEST(TransportV3CoverageFinal, DeadAccessorCleanup) {
-    cleanup_shm();
-    
-    int fd = shm_open("/librpc_node_dummy_dead", O_CREAT | O_RDWR, 0666);
-    ASSERT_TRUE(fd != -1);
-    ftruncate(fd, 50 * 1024 * 1024);
-    
-    void* ptr = mmap(nullptr, 50 * 1024 * 1024, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    ASSERT_TRUE(ptr != MAP_FAILED);
-    
-    MockNodeHeader* header = (MockNodeHeader*)ptr;
-    new (header) MockNodeHeader();
-    header->magic.store(0x4C524E33);
-    header->version.store(1);
-    header->ready.store(true);
-    header->owner_pid.store(999999); 
-    
-    munmap(ptr, 50 * 1024 * 1024);
-    close(fd);
-    
-    SharedMemoryTransportV3::cleanupOrphanedMemory();
-    
-    int fd2 = shm_open("/librpc_node_dummy_dead", O_RDONLY, 0666);
-    if (fd2 != -1) {
-        close(fd2);
-    }
     
     cleanup_shm();
 }

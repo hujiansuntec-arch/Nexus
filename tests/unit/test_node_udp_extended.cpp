@@ -47,7 +47,10 @@ TEST(NodeUdpExtendedTest, HeartbeatTimeout) {
 
     // Now wait for timeout (UDP_TIMEOUT_MS = 5000ms) + buffer
     std::cout << "Waiting for UDP timeout (approx 5s)..." << std::endl;
-    std::this_thread::sleep_for(std::chrono::milliseconds(5500));
+    for (int i = 0; i < 70; ++i) {
+        if (node_left_detected) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 
     EXPECT_TRUE(node_left_detected);
     EXPECT_EQ(left_node_id, remote_node_id);

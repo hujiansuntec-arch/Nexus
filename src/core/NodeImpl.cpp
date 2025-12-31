@@ -1686,7 +1686,7 @@ void NodeImpl::processPacket(const uint8_t* data, size_t size, [[maybe_unused]] 
     }
 
     std::string source_node(packet->node_id);
-    NEXUS_INFO("IMPL") << "Received message type " << (int)packet->msg_type << " from " << source_node;
+    NEXUS_DEBUG("IMPL") << "Received message type " << (int)packet->msg_type << " from " << source_node;
 
     // Skip our own messages (critical: avoid self-reception)
     if (source_node == node_id_) {

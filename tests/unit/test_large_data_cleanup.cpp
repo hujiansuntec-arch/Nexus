@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <unistd.h>
 #include <cstring>
 #include <thread>
@@ -99,18 +100,21 @@ TEST(LargeDataCleanup, KeepAliveProcess) {
     create_fake_channel(name, getpid(), 1);
     
     // Verify file exists
-    int fd = shm_open(shm_name.c_str(), O_RDONLY, 0666);
+    int fd = shm_open(shm_name.c_str(), O_RDWR, 0666);
     ASSERT_TRUE(fd >= 0);
-    close(fd);
+    
+    // Lock it to simulate active usage
+    flock(fd, LOCK_SH | LOCK_NB);
     
     // Run cleanup
     size_t cleaned = LargeDataChannel::cleanupOrphanedChannels(0);
     ASSERT_EQ(cleaned, 0);
     
     // Verify file still exists
-    fd = shm_open(shm_name.c_str(), O_RDONLY, 0666);
-    ASSERT_TRUE(fd >= 0);
-    close(fd);
+    struct stat st;
+    ASSERT_EQ(fstat(fd, &st), 0);
+    
+    close(fd); // Release lock
     
     // Cleanup manually
     shm_unlink(shm_name.c_str());

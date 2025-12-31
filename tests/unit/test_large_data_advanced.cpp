@@ -50,6 +50,7 @@ TEST(LargeDataAdvancedTest, RingWrapLogic) {
 TEST(LargeDataAdvancedTest, BufferFullLogic) {
     LargeDataChannel::Config config;
     config.buffer_size = 1024 * 1024;
+    config.overflow_policy = LargeDataOverflowPolicy::BLOCK;
     std::string channel_name = "test_adv_full";
 
     auto channel = LargeDataChannel::create(channel_name, config);

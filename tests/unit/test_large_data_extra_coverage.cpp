@@ -1,6 +1,8 @@
 #include "simple_test.h"
 #include "nexus/transport/LargeDataChannel.h"
 #include <sys/mman.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
@@ -67,16 +69,19 @@ TEST(LargeDataExtraCoverage, Cleanup_ProcessAlive) {
     control->writer_heartbeat = time(NULL); // Fresh heartbeat
     
     munmap(addr, sizeof(RingBufferControl) + 4096);
-    close(fd);
     
-    // Should NOT clean up because PID 1 is alive
+    // Lock the file to simulate active usage
+    flock(fd, LOCK_SH | LOCK_NB);
+    
+    // Should NOT clean up because we hold the lock
     size_t cleaned = LargeDataChannel::cleanupOrphanedChannels(10);
     ASSERT_EQ(cleaned, 0);
     
     // Verify file exists
-    fd = shm_open(channel_name.c_str(), O_RDONLY, 0666);
-    ASSERT_NE(fd, -1);
-    close(fd);
+    struct stat st;
+    ASSERT_EQ(fstat(fd, &st), 0);
+    
+    close(fd); // Releases lock
     shm_unlink(channel_name.c_str());
 }
 
