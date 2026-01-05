@@ -19,6 +19,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "QNX")
 else()
     set(IS_QNX FALSE)
     message(STATUS "Building for Linux platform")
+    # Enable SSE4.2 for hardware CRC32 on x86_64
+    if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "x86_64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+        add_compile_options(-msse4.2)
+        message(STATUS "Enabled SSE4.2 optimizations")
+    endif()
 endif()
 
 # Options

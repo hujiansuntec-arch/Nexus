@@ -1068,7 +1068,12 @@ size_t NodeImpl::cleanupOrphanedChannels() {
     total_cleaned += channel_cleaned;
 
     // 2. Cleanup SharedMemoryTransportV3 orphaned node shared memory
-    if (SharedMemoryTransportV3::cleanupOrphanedMemory()) {
+    std::string my_shm_name;
+    if (shm_transport_v3_) {
+        my_shm_name = shm_transport_v3_->getMyShmName();
+    }
+
+    if (SharedMemoryTransportV3::cleanupOrphanedMemory(my_shm_name)) {
         NEXUS_DEBUG("IMPL") << "Cleaned up orphaned transport memory";
     }
 
