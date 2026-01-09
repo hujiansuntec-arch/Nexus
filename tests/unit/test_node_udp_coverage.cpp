@@ -127,9 +127,10 @@ TEST(NodeUdpCoverage, HandleHeartbeatAndTimeout) {
     });
 
     // Wait for timeout (UDP_TIMEOUT_MS = 5000ms)
-    // We wait 7s to ensure the periodic check (every 1s) catches it
+    // We wait 5.5s
+    // Note: This makes the test slow, but it's necessary for coverage
     printf("Waiting for UDP timeout (5s)...\n");
-    for (int i = 0; i < 70; i++) {
+    for (int i = 0; i < 55; i++) {
         if (node_left_triggered) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }

@@ -608,7 +608,6 @@ TEST(NodeImplCoverageFinal, LargeDataBufferFull) {
     LargeDataChannel::Config config;
     config.buffer_size = 8192; // 8KB
     config.max_block_size = 4096;
-    config.overflow_policy = LargeDataOverflowPolicy::BLOCK; // Force BLOCK to test timeout
     
     auto channel = LargeDataChannel::create("test_channel", config);
     

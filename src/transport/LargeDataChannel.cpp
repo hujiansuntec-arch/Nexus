@@ -7,7 +7,6 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>  // 用于 kill() 检测进程存活
-#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -183,15 +182,6 @@ bool LargeDataChannel::initialize() {
         return false;
     }
 
-    // 🔒 核心修复：获取共享锁，标记该通道正在被使用
-    // 当进程崩溃时，操作系统会自动释放该锁
-    if (flock(shm_fd_, LOCK_SH) < 0) {
-        NEXUS_ERROR("LargeData") << "Failed to lock shared memory: " << strerror(errno);
-        close(shm_fd_);
-        shm_fd_ = -1;
-        return false;
-    }
-
     // 获取当前大小
     struct stat st;
     if (fstat(shm_fd_, &st) < 0) {
@@ -267,17 +257,15 @@ bool LargeDataChannel::initialize() {
     return true;
 }
 
-// 零拷贝写入：分配空间
-LargeDataChannel::WritableBlock LargeDataChannel::allocWrite(size_t size) {
-    WritableBlock block;
+// 写入大数据
+int64_t LargeDataChannel::write(const std::string& topic, const uint8_t* data, size_t size) {
     if (size > config_.max_block_size) {
         NEXUS_ERROR("LargeData") << "Data size " << size << " exceeds max block size " << config_.max_block_size;
-        return block;
+        return -1;
     }
 
-    // 🔧 优化2：数据对齐 (64字节对齐，Cache Line友好)
+    // 总大小 = 头部 + 数据
     size_t total_size = sizeof(LargeDataHeader) + size;
-    size_t aligned_total_size = (total_size + 63) & ~63;
 
     // 清理死亡的读者（定期执行）
     cleanupDeadReaders();
@@ -288,108 +276,39 @@ LargeDataChannel::WritableBlock LargeDataChannel::allocWrite(size_t size) {
     uint64_t used = write_pos - min_read_pos;
 
     // 缓冲区满时的处理策略
-    if (used + aligned_total_size > control_->capacity) {
+    if (used + total_size > control_->capacity) {
         switch (config_.overflow_policy) {
-            case LargeDataOverflowPolicy::DROP_OLDEST: {
-                // 循环直到有足够空间
-                int max_loops = 1000;  // 防止死循环
-                while (used + aligned_total_size > control_->capacity && max_loops-- > 0) {
-                    uint64_t current_min_pos = min_read_pos;
-                    uint64_t read_offset = current_min_pos % control_->capacity;
-
-                    // 1. 处理环绕情况 (Wrap-around)
-                    if (read_offset + sizeof(LargeDataHeader) > control_->capacity) {
-                        uint64_t skip = control_->capacity - read_offset;
-                        // 强制所有在末尾的读者跳到开头
-                        for (size_t i = 0; i < MAX_READERS; ++i) {
-                            auto& reader = control_->readers[i];
-                            if (reader.active.load(std::memory_order_acquire)) {
-                                uint64_t rpos = reader.read_pos.load(std::memory_order_acquire);
-                                if (rpos == current_min_pos) {
-                                    reader.read_pos.compare_exchange_strong(rpos, current_min_pos + skip);
-                                }
-                            }
-                        }
-                        // 重新计算 min_read_pos
-                        min_read_pos = getMinReadPos();
-                        used = write_pos - min_read_pos;
-                        continue;
-                    }
-
-                    // 2. 读取头部信息
-                    LargeDataHeader* header = reinterpret_cast<LargeDataHeader*>(buffer_ + read_offset);
-                    uint32_t magic =
-                        reinterpret_cast<std::atomic<uint32_t>*>(&header->magic)->load(std::memory_order_acquire);
-
-                    size_t drop_size = 0;
-                    bool valid_header = false;
-
-                    if (magic == LargeDataHeader::MAGIC && header->size <= config_.max_block_size) {
-                        size_t total_size = sizeof(LargeDataHeader) + header->size;
-                        drop_size = (total_size + 63) & ~63;
-                        valid_header = true;
-                    } else {
-                        // 头部无效（可能是数据损坏或未初始化区域）
-                        // 这种情况下，为了恢复，我们尝试跳过一个最小对齐单位
-                        // 如果是在缓冲区末尾遇到的无效头部，很可能是Padding，直接跳到末尾
-                        drop_size = control_->capacity - read_offset;
-                        if (drop_size < 64) drop_size = 64; // 至少跳过64字节
-                    }
-
-                    // 3. 强制推进慢速读者
-                    bool any_advanced = false;
-                    for (size_t i = 0; i < MAX_READERS; ++i) {
-                        auto& reader = control_->readers[i];
-                        if (reader.active.load(std::memory_order_acquire)) {
-                            uint64_t rpos = reader.read_pos.load(std::memory_order_acquire);
-                            if (rpos == current_min_pos) {
-                                if (reader.read_pos.compare_exchange_strong(rpos, current_min_pos + drop_size)) {
-                                    any_advanced = true;
-                                }
-                            }
-                        }
-                    }
-
-                    if (any_advanced && valid_header) {
-                        size_t dropped = total_dropped_.fetch_add(1, std::memory_order_relaxed) + 1;
-                        // Callback
-                        if (config_.overflow_callback) {
-                            try {
-                                config_.overflow_callback(shm_name_, header->topic, header->sequence, dropped);
-                            } catch (...) {
-                            }
-                        }
-                    }
-
-                    // 重新计算
-                    min_read_pos = getMinReadPos();
-                    used = write_pos - min_read_pos;
-                }
-
-                if (max_loops <= 0) {
-                    NEXUS_ERROR("LargeData") << "Failed to free space after 1000 attempts (DROP_OLDEST)";
-                    return block;  // Failed
-                }
+            case LargeDataOverflowPolicy::DROP_OLDEST:
+                // 不实现：SPMC模式下无法安全丢弃（会影响所有读者）
+                // 返回失败，由上层决定是否重试
+                NEXUS_ERROR("LargeData") << "Buffer full (DROP_OLDEST not supported in SPMC mode)";
                 break;
-            }
 
-            case LargeDataOverflowPolicy::DROP_NEWEST: {
-                size_t dropped = total_dropped_.fetch_add(1, std::memory_order_relaxed) + 1;
-                NEXUS_ERROR("LargeData") << "Buffer full, dropping newest data (total: " << dropped << ")";
-                if (config_.overflow_callback) {
-                    try {
-                        uint64_t seq = control_->sequence.load(std::memory_order_relaxed);
-                        config_.overflow_callback(shm_name_, "", seq, dropped);
-                    } catch (...) {
+            case LargeDataOverflowPolicy::DROP_NEWEST:
+                // 丢弃当前写入
+                {
+                    size_t dropped = total_dropped_.fetch_add(1, std::memory_order_relaxed) + 1;
+                    NEXUS_ERROR("LargeData") << "Buffer full, dropping newest data (total: " << dropped << ")";
+
+                    // 调用溢出回调
+                    if (config_.overflow_callback) {
+                        try {
+                            uint64_t seq = control_->sequence.load(std::memory_order_relaxed);
+                            config_.overflow_callback(shm_name_, topic, seq, dropped);
+                        } catch (...) {
+                            // 忽略回调异常
+                        }
                     }
                 }
-                return block;
-            }
+                return -1;
 
             case LargeDataOverflowPolicy::BLOCK:
+                // 阻塞等待（不推荐，可能死锁）
                 NEXUS_ERROR("LargeData") << "Buffer full (BLOCK policy not recommended)";
-                return block;
+                break;
         }
+
+        return -1;
     }
 
     // 更新写端心跳
@@ -397,25 +316,25 @@ LargeDataChannel::WritableBlock LargeDataChannel::allocWrite(size_t size) {
     control_->writer_heartbeat.store(current_time, std::memory_order_relaxed);
 
     // 获取序列号
-    block.sequence = control_->sequence.fetch_add(1);
+    uint64_t seq = control_->sequence.fetch_add(1);
 
     // 计算写入位置（环形缓冲区）
     uint64_t write_offset = write_pos % control_->capacity;
 
     // 检查是否需要环绕
-    if (write_offset + aligned_total_size > control_->capacity) {
+    if (write_offset + total_size > control_->capacity) {
         // 环绕到开头（浪费剩余空间）
         uint64_t skip_size = control_->capacity - write_offset;
         control_->write_pos.fetch_add(skip_size);
         write_pos = control_->write_pos.load();
         write_offset = 0;
 
-        // 通知所有读者跳过浪费的空间
+        // 🔧 关键修复：通知所有读者跳过浪费的空间
         for (size_t i = 0; i < MAX_READERS; ++i) {
             if (control_->readers[i].active.load(std::memory_order_acquire)) {
                 uint64_t reader_pos = control_->readers[i].read_pos.load(std::memory_order_acquire);
-                // 检查读者是否在被跳过的区域内
-                if (reader_pos < write_pos && (reader_pos % control_->capacity) >= (control_->capacity - skip_size)) {
+                // 如果读者还在旧的环内，需要跳过浪费的空间
+                if (reader_pos < write_pos && (reader_pos % control_->capacity) >= write_offset) {
                     control_->readers[i].read_pos.store(write_pos, std::memory_order_release);
                     NEXUS_WARN("LargeData")
                         << "Reader #" << i << " skipped " << skip_size << " bytes due to ring wrap (from " << reader_pos
@@ -425,61 +344,36 @@ LargeDataChannel::WritableBlock LargeDataChannel::allocWrite(size_t size) {
         }
     }
 
-    block.data = buffer_ + write_offset + sizeof(LargeDataHeader);
-    block.size = size;
-    block.write_offset = write_offset;
-
-    return block;
-}
-
-// 零拷贝写入：提交
-int64_t LargeDataChannel::commitWrite(const WritableBlock& block, const std::string& topic) {
-    if (!block.isValid()) return -1;
-
-    // 重新计算对齐大小
-    size_t total_size = sizeof(LargeDataHeader) + block.size;
-    size_t aligned_total_size = (total_size + 63) & ~63;
-
-    // 准备头部
-    LargeDataHeader* header = reinterpret_cast<LargeDataHeader*>(buffer_ + block.write_offset);
-    header->magic = 0;  // 暂时设为0
-    header->size = static_cast<uint32_t>(block.size);
-    header->sequence = block.sequence;
+    // 准备头部（先不写magic，避免读端读到未完成数据）
+    LargeDataHeader* header = reinterpret_cast<LargeDataHeader*>(buffer_ + write_offset);
+    header->magic = 0;  // 暂时设为0，最后才写入作为"完成标志"
+    header->size = static_cast<uint32_t>(size);
+    header->sequence = seq;
     strncpy(header->topic, topic.c_str(), sizeof(header->topic) - 1);
     header->topic[sizeof(header->topic) - 1] = '\0';
 
-    // 🔧 优化3：CRC32配置化
-    if (config_.enable_crc32) {
-        header->crc32 = calculateCRC32(block.data, block.size);
-    } else {
-        header->crc32 = 0;
-    }
+    // 写入数据
+    uint8_t* data_ptr = buffer_ + write_offset + sizeof(LargeDataHeader);
+    memcpy(data_ptr, data, size);
 
-    // 内存屏障
+    // 计算CRC32
+    header->crc32 = calculateCRC32(data, size);
+
+    // 内存屏障：确保所有数据写入对其他进程可见
     std::atomic_thread_fence(std::memory_order_release);
 
-    // 写入Magic
+    // 最后写入magic作为"发布"标志（发布-订阅模式）
+    // 必须使用atomic store确保跨进程可见性
     reinterpret_cast<std::atomic<uint32_t>*>(&header->magic)->store(LargeDataHeader::MAGIC, std::memory_order_release);
 
-    // 更新写指针
-    control_->write_pos.fetch_add(aligned_total_size, std::memory_order_release);
+    // 更新写指针（使用release语义）
+    control_->write_pos.fetch_add(total_size, std::memory_order_release);
 
     // 更新统计
     total_writes_.fetch_add(1);
-    total_bytes_written_.fetch_add(block.size);
+    total_bytes_written_.fetch_add(size);
 
-    return block.sequence;
-}
-
-// 写入大数据（兼容旧接口）
-int64_t LargeDataChannel::write(const std::string& topic, const uint8_t* data, size_t size) {
-    WritableBlock block = allocWrite(size);
-    if (!block.isValid()) return -1;
-
-    // 内存拷贝
-    memcpy(block.data, data, size);
-
-    return commitWrite(block, topic);
+    return seq;
 }
 
 // 尝试读取数据块
@@ -542,13 +436,7 @@ bool LargeDataChannel::tryRead(DataBlock& block) {
             return false;
         } else {
             // SIZE_EXCEEDED或CRC_ERROR，跳过这个数据块
-            size_t skip_size = sizeof(LargeDataHeader);
-            if (validation_result == ReadResult::CRC_ERROR) {
-                // 如果是CRC错误，说明头部有效，可以跳过整个块
-                size_t total_size = sizeof(LargeDataHeader) + header->size;
-                skip_size = (total_size + 63) & ~63;
-            }
-            control_->readers[reader_id_].read_pos.fetch_add(skip_size, std::memory_order_release);
+            control_->readers[reader_id_].read_pos.fetch_add(sizeof(LargeDataHeader), std::memory_order_release);
             block.result = validation_result;
             return false;
         }
@@ -571,8 +459,7 @@ void LargeDataChannel::releaseBlock(const DataBlock& block) {
 
     // 更新当前读者的read_pos（使用release语义）
     size_t total_size = sizeof(LargeDataHeader) + block.size;
-    size_t aligned_total_size = (total_size + 63) & ~63;
-    control_->readers[reader_id_].read_pos.fetch_add(aligned_total_size, std::memory_order_release);
+    control_->readers[reader_id_].read_pos.fetch_add(total_size, std::memory_order_release);
 
     // 更新统计
     total_reads_.fetch_add(1, std::memory_order_relaxed);
@@ -601,14 +488,12 @@ LargeDataChannel::ReadResult LargeDataChannel::validateBlock(const LargeDataHead
     }
 
     // 验证CRC32
-    if (config_.enable_crc32) {
-        const uint8_t* data = reinterpret_cast<const uint8_t*>(header) + sizeof(LargeDataHeader);
-        uint32_t calculated_crc = calculateCRC32(data, header->size);
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(header) + sizeof(LargeDataHeader);
+    uint32_t calculated_crc = calculateCRC32(data, header->size);
 
-        if (calculated_crc != header->crc32) {
-            NEXUS_ERROR("LargeData") << "CRC32 mismatch: expected " << header->crc32 << ", got " << calculated_crc;
-            return ReadResult::CRC_ERROR;
-        }
+    if (calculated_crc != header->crc32) {
+        NEXUS_ERROR("LargeData") << "CRC32 mismatch: expected " << header->crc32 << ", got " << calculated_crc;
+        return ReadResult::CRC_ERROR;
     }
 
     return ReadResult::SUCCESS;
@@ -646,16 +531,7 @@ size_t LargeDataChannel::getAvailableSpace() const {
 
 // 检查是否可以写入
 bool LargeDataChannel::canWrite(size_t size) const {
-    size_t total_size = sizeof(LargeDataHeader) + size;
-    size_t aligned_total_size = (total_size + 63) & ~63;
-
-    // 如果策略是 DROP_OLDEST 或 DROP_NEWEST，只要单块大小不超过容量，总是可以写入
-    if (config_.overflow_policy == LargeDataOverflowPolicy::DROP_OLDEST ||
-        config_.overflow_policy == LargeDataOverflowPolicy::DROP_NEWEST) {
-        return aligned_total_size <= control_->capacity;
-    }
-
-    return getAvailableSpace() >= aligned_total_size;
+    return getAvailableSpace() >= size;
 }
 
 // 设置溢出策略
@@ -674,8 +550,8 @@ void LargeDataChannel::setOverflowCallback(LargeDataOverflowCallback callback) {
 }
 
 // 清理过期的大数据通道（静态函数）
-size_t LargeDataChannel::cleanupOrphanedChannels(uint32_t /*timeout_seconds*/) {
-    NEXUS_DEBUG("LargeData") << "Scanning for orphaned channels (using file locks)...";
+size_t LargeDataChannel::cleanupOrphanedChannels(uint32_t timeout_seconds) {
+    NEXUS_DEBUG("LargeData") << "Scanning for orphaned channels (timeout: " << timeout_seconds << "s)...";
 
     DIR* dir = opendir("/dev/shm");
     if (!dir) {
@@ -686,6 +562,23 @@ size_t LargeDataChannel::cleanupOrphanedChannels(uint32_t /*timeout_seconds*/) {
     struct dirent* entry;
     size_t cleaned_count = 0;
     size_t total_freed = 0;
+    time_t current_time = time(nullptr);
+
+    // 辅助函数：检查进程是否存活
+    auto isProcessAlive = [](int32_t pid) -> bool {
+        if (pid <= 0) {
+            return false;  // 无效PID
+        }
+
+        // kill(pid, 0) 不发送信号，只检查进程是否存在
+        if (kill(pid, 0) == 0) {
+            return true;  // 进程存在且有权限访问
+        }
+
+        // ESRCH: 进程不存在
+        // EPERM: 进程存在但无权限（也算存活）
+        return errno != ESRCH;
+    };
 
     while ((entry = readdir(dir)) != nullptr) {
         std::string name = entry->d_name;
@@ -701,35 +594,107 @@ size_t LargeDataChannel::cleanupOrphanedChannels(uint32_t /*timeout_seconds*/) {
             continue;
         }
 
-        // 获取文件大小用于统计
+        // 获取文件大小
         struct stat st;
-        size_t shm_size = 0;
-        if (fstat(fd, &st) == 0) {
-            shm_size = st.st_size;
+        if (fstat(fd, &st) != 0) {
+            close(fd);
+            continue;
         }
 
-        // 🔒 核心修复：尝试获取排他锁
-        // 如果能获取到排他锁，说明没有任何进程持有共享锁（即没有进程在使用该通道）
-        // LOCK_NB 确保不阻塞
-        if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
-            // 成功获取排他锁，说明是僵尸文件，可以安全删除
+        size_t shm_size = st.st_size;
+
+        // 映射共享内存以检查控制结构
+        void* addr = mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (addr == MAP_FAILED) {
+            close(fd);
+            continue;
+        }
+
+        bool should_cleanup = false;
+        std::string cleanup_reason;
+
+        // 检查是否为有效的LargeDataChannel
+        if (shm_size >= sizeof(RingBufferControl) + LARGE_DATA_MIN_VALID_SIZE) {
+            RingBufferControl* control = static_cast<RingBufferControl*>(addr);
+
+            // **优先级1: 引用计数检测**
+            int32_t ref_count = control->ref_count.load(std::memory_order_relaxed);
+            if (ref_count == 0) {
+                should_cleanup = true;
+                cleanup_reason = "zero ref_count";
+            }
+
+            // **优先级2: 所有进程死亡检测**
+            if (!should_cleanup) {
+                int32_t writer_pid = control->writer_pid.load(std::memory_order_relaxed);
+                bool writer_alive = isProcessAlive(writer_pid);
+
+                // 检查所有读者是否存活
+                bool any_reader_alive = false;
+                for (size_t i = 0; i < MAX_READERS; ++i) {
+                    if (control->readers[i].active.load(std::memory_order_relaxed)) {
+                        int32_t reader_pid = control->readers[i].pid.load(std::memory_order_relaxed);
+                        if (isProcessAlive(reader_pid)) {
+                            any_reader_alive = true;
+                            break;
+                        }
+                    }
+                }
+
+                // 如果写端和所有读者都死亡，清理
+                if (!writer_alive && !any_reader_alive && (writer_pid > 0 || control->num_readers.load() > 0)) {
+                    should_cleanup = true;
+                    cleanup_reason = "all processes dead (writer PID: " + std::to_string(writer_pid) + ")";
+                }
+            }
+
+            // **优先级3: 心跳超时检测（fallback）**
+            if (!should_cleanup) {
+                uint64_t writer_hb = control->writer_heartbeat.load(std::memory_order_relaxed);
+                bool writer_timeout = (writer_hb > 0 && (current_time - writer_hb) > timeout_seconds);
+
+                // 检查所有读者心跳
+                bool all_readers_timeout = true;
+                uint32_t num_readers = control->num_readers.load(std::memory_order_relaxed);
+                if (num_readers > 0) {
+                    for (size_t i = 0; i < MAX_READERS; ++i) {
+                        if (control->readers[i].active.load(std::memory_order_relaxed)) {
+                            uint64_t hb = control->readers[i].heartbeat.load(std::memory_order_relaxed);
+                            if (hb == 0 || (current_time - hb) <= timeout_seconds) {
+                                all_readers_timeout = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (writer_timeout && (num_readers == 0 || all_readers_timeout)) {
+                    should_cleanup = true;
+                    cleanup_reason = "all heartbeats timeout";
+                }
+            }
+        } else {
+            // 太小，不是有效的LargeDataChannel
+            if ((current_time - st.st_mtime) > timeout_seconds) {
+                should_cleanup = true;
+                cleanup_reason = "invalid size and old";
+            }
+        }
+
+        // 清理
+        munmap(addr, shm_size);
+        close(fd);
+
+        if (should_cleanup) {
             if (shm_unlink(name.c_str()) == 0) {
                 cleaned_count++;
                 total_freed += shm_size;
-                NEXUS_DEBUG("LargeData") << "✓ Cleaned orphaned channel: " << name
-                                         << " (" << (shm_size / 1024 / 1024) << " MB)";
+                NEXUS_DEBUG("LargeData") << "✓ Cleaned: " << name << " (" << (shm_size / 1024 / 1024) << " MB) - "
+                                         << cleanup_reason;
             } else {
                 NEXUS_ERROR("LargeData") << "✗ Failed to unlink " << name << ": " << strerror(errno);
             }
-
-            // 解锁（虽然close会自动解锁，但显式调用是个好习惯）
-            flock(fd, LOCK_UN);
-        } else {
-            // EWOULDBLOCK 说明有人在使用
-            // NEXUS_DEBUG("LargeData") << "Channel in use: " << name;
         }
-
-        close(fd);
     }
 
     closedir(dir);

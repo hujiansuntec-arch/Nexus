@@ -7,11 +7,10 @@ cd "$(dirname "$0")"
 
 # 设置库路径
 export LD_LIBRARY_PATH=./build:$LD_LIBRARY_PATH
-export NEXUS_LOG_LEVEL=DEBUG  # 使用DEBUG级别查看详细连接信息
 
 # 清理旧的共享内存
 echo "清理环境..."
-# rm -f /dev/shm/librpc_* /dev/shm/test_channel
+rm -f /dev/shm/librpc_* /dev/shm/test_channel
 killall -9 test_large_receiver 2>/dev/null || true
 sleep 1
 
@@ -29,11 +28,6 @@ declare -a tests=(
     "20:4096:测试5: 20次 × 4MB"
 )
 
-# 启动接收端
-    ./build/test_large_receiver > ./tmp/receiver.log 2>&1 &
-    RECEIVER_PID=$!
-    sleep 1
-
 for test in "${tests[@]}"; do
     IFS=':' read -r count size desc <<< "$test"
     
@@ -41,13 +35,18 @@ for test in "${tests[@]}"; do
     echo "参数: ${count}次, ${size}KB/次"
     echo ""
     
+    # 启动接收端
+    ./build/test_large_receiver > ./tmp/receiver.log 2>&1 &
+    RECEIVER_PID=$!
+    sleep 1
+    
     # 运行发送端
     ./build/test_large_sender $count $size 2>&1 | tee ./tmp/sender.log | grep -E "(吞吐量|平均速度|耗时|成功)"
     
     echo ""
     
     # 停止接收端
-    # kill -INT $RECEIVER_PID 2>/dev/null || true
+    kill -INT $RECEIVER_PID 2>/dev/null || true
     sleep 1
     
     # 显示接收端统计
@@ -58,12 +57,12 @@ for test in "${tests[@]}"; do
     echo ""
     
     # 清理
-    # rm -f /dev/shm/test_channel
+    rm -f /dev/shm/test_channel
     sleep 1
 done
 
 echo "======================================"
-echo "测试完成"
+echo "性能测试完成！"
 echo "======================================"
 echo ""
 

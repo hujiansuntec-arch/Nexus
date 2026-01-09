@@ -31,7 +31,7 @@ LibRPC是一个专为QNX车载系统设计的高性能IPC框架，核心设计�
 - **低延迟**: P50 < 10μs（跨进程通信）
 - **高吞吐**: > 50,000 msg/s @ 256字节
 - **低CPU占用**: < 6%（稳定负载）
-- **内存效率**: 默认40MB/节点（64队列配置），可配置
+- **内存效率**: 默认33MB/节点，可配置8-132MB
 - **高可靠性**: 异常退出2-5秒内自动恢复
 
 ### 1.2 关键创新
@@ -239,64 +239,65 @@ public:
 
 ### 3.2 LockFreeRingBuffer
 
-**无锁SPSC变长队列设计**：
+**无锁SPSC队列设计**：
 
 ```cpp
-template <size_t BUFFER_SIZE>
+template <size_t CAPACITY>
 class LockFreeRingBuffer {
-public:
-    // 变长消息帧头 (8字节)
-    struct FrameHeader {
-        uint32_t length; // 总长度（含Header），若为0则表示Padding
-        uint32_t magic;  // 校验魔数 (0xCAFEBABE)
-    };
-
 private:
-    // 连续字节缓冲区，支持变长消息
-    alignas(64) uint8_t buffer_[BUFFER_SIZE]; 
+    struct Slot {
+        char sender_id[64];
+        uint8_t data[MESSAGE_SIZE];
+        size_t size;
+    };
     
-    // 缓存行对齐的原子指针，避免伪共享
-    alignas(64) std::atomic<uint64_t> head_;  // 写位置（字节偏移）
-    alignas(64) std::atomic<uint64_t> tail_;  // 读位置（字节偏移）
+    Slot slots_[CAPACITY];
+    std::atomic<uint32_t> write_pos_{0};  // 写位置
+    std::atomic<uint32_t> read_pos_{0};   // 读位置
     
 public:
     // 写入（单生产者）
-    bool tryWrite(const uint8_t* data, size_t size) {
-        // 1. 计算所需空间（Header + Data + 8字节对齐）
-        size_t needed = (sizeof(FrameHeader) + size + 7) & ~7;
+    bool tryWrite(const char* sender_id, 
+                  const uint8_t* data, size_t size) {
+        uint32_t w = write_pos_.load(std::memory_order_relaxed);
+        uint32_t r = read_pos_.load(std::memory_order_acquire);
         
-        uint64_t head = head_.load(std::memory_order_acquire);
-        uint64_t tail = tail_.load(std::memory_order_acquire);
+        // 检查是否满（预留一个slot）
+        if (((w + 1) % CAPACITY) == r) {
+            return false;
+        }
         
-        // 2. 检查空间并处理环形回绕
-        // 如果尾部空间不足，填充Padding并回绕到头部
+        // 写入数据（无竞争）
+        Slot& slot = slots_[w];
+        strncpy(slot.sender_id, sender_id, 63);
+        memcpy(slot.data, data, size);
+        slot.size = size;
         
-        // 3. 写入Header和Data
-        // ...
-        
-        // 4. 更新head指针（release语义）
-        head_.store(new_head, std::memory_order_release);
+        // 更新写位置（release语义确保数据可见）
+        write_pos_.store((w + 1) % CAPACITY, 
+                        std::memory_order_release);
         return true;
     }
     
     // 读取（单消费者）
-    bool tryRead(uint8_t* buffer, size_t max_size, size_t& out_size) {
-        uint64_t tail = tail_.load(std::memory_order_relaxed);
-        uint64_t head = head_.load(std::memory_order_acquire);
+    bool tryRead(char* sender_id, uint8_t* data, size_t& size) {
+        uint32_t r = read_pos_.load(std::memory_order_relaxed);
+        uint32_t w = write_pos_.load(std::memory_order_acquire);
         
-        // 1. 检查是否为空
-        if (tail == head) return false;
+        // 检查是否空
+        if (r == w) {
+            return false;
+        }
         
-        // 2. 读取Header
-        // 处理Padding（如果遇到Padding Header，跳过并回绕）
+        // 读取数据
+        const Slot& slot = slots_[r];
+        strncpy(sender_id, slot.sender_id, 64);
+        memcpy(data, slot.data, slot.size);
+        size = slot.size;
         
-        // 3. 读取数据
-        // ...
-        
-        // 4. 更新tail指针（release语义）
-        tail_.store(new_tail, std::memory_order_release);
-        return true;
-    }
+        // 更新读位置
+        read_pos_.store((r + 1) % CAPACITY, 
+                       std::memory_order_release);
         return true;
     }
 };

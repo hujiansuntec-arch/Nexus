@@ -323,14 +323,14 @@ node->subscribe("vision", {"image_data"},
 ```cpp
 // 低内存场景（嵌入式设备）
 librpc::Config config;
-config.max_inbound_queues = 8;   // ~5MB内存
+config.max_inbound_queues = 8;   // ~8MB内存
 config.queue_capacity = 64;
 config.notify_mechanism = librpc::NotifyMechanism::SEMAPHORE;
 auto node = librpc::createNode("low_mem", config);
 
 // 高并发场景（服务器）
 librpc::Config config;
-config.max_inbound_queues = 64;  // ~40MB内存
+config.max_inbound_queues = 64;  // ~33MB内存
 config.queue_capacity = 256;
 config.notify_mechanism = librpc::NotifyMechanism::CONDITION_VARIABLE;
 auto node = librpc::createNode("high_perf", config);
@@ -488,12 +488,12 @@ while (err == librpc::TIMEOUT) {
 **A**: 调整配置降低内存占用：
 
 ```cpp
-// 默认配置：40MB
+// 默认配置：33MB
 librpc::Config config;
-config.max_inbound_queues = 64;
+config.max_inbound_queues = 32;
 config.queue_capacity = 256;
 
-// 低内存配置：10MB
+// 低内存配置：8MB
 config.max_inbound_queues = 16;
 config.queue_capacity = 64;
 ```
@@ -574,7 +574,7 @@ MIT License
 
 ### v3.0 (2025-11-26) - 内存优化 + 跨平台
 
-- ✅ 内存占用优化（529MB → 40MB，降低92%）
+- ✅ 内存占用优化（529MB → 33MB，降低94%）
 - ✅ 配置化队列参数
 - ✅ QNX平台完整支持
 - ✅ CMake现代化构建系统
