@@ -169,16 +169,13 @@ public:
     void warmupConnections();
 
     /**
-     * @brief Get my shared memory name
+     * @brief Clean up orphaned shared memory (static utility)
+     * Removes registry and node shared memories if no processes are using them
+     * @return true if cleanup succeeded or nothing to clean
      */
-    std::string getMyShmName() const { return my_shm_name_; }
+    static bool cleanupOrphanedMemory();
 
     /**
-     * @brief Cleanup orphaned shared memory files
-     * @param ignore_name Name of shared memory to ignore (e.g. current process's shm)
-     * @return true if cleanup performed
-     */
-    static bool cleanupOrphanedMemory(const std::string& ignore_name = "");    /**
      * @brief Get count of active nodes in registry (static utility)
      * @return Number of active nodes, or -1 if registry doesn't exist
      */

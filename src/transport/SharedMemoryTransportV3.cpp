@@ -51,12 +51,12 @@ constexpr uint64_t Nexus::rpc::SharedMemoryTransportV3::QUEUE_TIMEOUT_MS;
 
 // Queue management and polling
 #define SHM_QUEUE_REFRESH_INTERVAL \
-    100  // Queue list refresh interval (loop iterations) - increased from 10 to reduce CPU overhead
+    10  // Queue list refresh interval (loop iterations) - reduced from 200 for faster new queue detection
 #define SHM_EMPTY_LOOP_THRESHOLD_SHORT 3  // Threshold for short timeout
 #define SHM_EMPTY_LOOP_THRESHOLD_LONG 10  // Threshold for long timeout
 
 // Timeout strategies (milliseconds)
-#define SHM_TIMEOUT_SHORT_MS 2  // Short timeout (active receiving) - increased from 1ms to reduce CPU
+#define SHM_TIMEOUT_SHORT_MS 1  // Short timeout (active receiving) - 降低到1ms for faster control message processing
 #define SHM_TIMEOUT_MEDIUM_MS 5  // Medium timeout - 降低from 20ms
 #define SHM_TIMEOUT_LONG_MS 10   // Long timeout (idle state) - 降低from 50ms
 #define SHM_TIMEOUT_IDLE_MS 100  // Idle wait when no queues available
@@ -620,7 +620,7 @@ SharedMemoryTransportV3::TransportStats SharedMemoryTransportV3::getStats() cons
     return stats;
 }
 
-bool SharedMemoryTransportV3::cleanupOrphanedMemory(const std::string& ignore_name) {
+bool SharedMemoryTransportV3::cleanupOrphanedMemory() {
     NEXUS_DEBUG("SHM-V3") << "Cleaning up orphaned shared memory (using file locks)...";
 
     size_t cleaned_count = 0;
@@ -651,14 +651,6 @@ bool SharedMemoryTransportV3::cleanupOrphanedMemory(const std::string& ignore_na
 
         // 尝试打开共享内存
         std::string full_name = "/" + name;
-
-        // 🛡️ QNX兼容性保护：跳过当前进程正在使用的共享内存
-        // 在QNX上，fcntl锁是基于进程的，如果在这里打开并关闭自己的共享内存，
-        // 会导致主逻辑持有的锁被意外释放！
-        if (!ignore_name.empty() && full_name == ignore_name) {
-            continue;
-        }
-
         int fd = shm_open(full_name.c_str(), O_RDWR, 0);
         if (fd < 0) {
             continue;
