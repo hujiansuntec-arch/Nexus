@@ -1626,41 +1626,31 @@ void SharedMemoryTransportV3::heartbeatLoop() {
             }
         }
 
-        // Get nodes before cleanup (for detecting removed nodes)
-        std::vector<NodeInfo> nodes_before;
+        registry_.cleanupStaleNodes(NODE_TIMEOUT_MS);
+
+        // 🔧 CRITICAL FIX: Reconcile active connections with registry
+        // We must check if any connected nodes are missing from the registry,
+        // regardless of who cleaned them up (us or another process).
         if (node_impl_) {
-            nodes_before = registry_.getAllNodes();
-        }
-
-        // Clean up stale nodes from registry
-        int cleaned = registry_.cleanupStaleNodes(NODE_TIMEOUT_MS);
-
-        // Notify NodeImpl about removed nodes (trigger NODE_LEFT events)
-        if (cleaned > 0 && node_impl_) {
-            auto nodes_after = registry_.getAllNodes();
-
-            // Find which nodes were removed
-            for (const auto& node : nodes_before) {
-                // Skip self
-                if (node.node_id == node_id_) {
-                    continue;
-                }
-
-                // Check if node still exists
-                bool found = false;
-                for (const auto& n : nodes_after) {
-                    if (n.node_id == node.node_id) {
-                        found = true;
-                        break;
+            auto current_nodes = registry_.getAllNodes();
+            std::set<std::string> registry_node_ids;
+            for (const auto& node : current_nodes) {
+                registry_node_ids.insert(node.node_id);
+            }
+            std::vector<std::string> dead_nodes;
+            {
+                std::lock_guard<std::mutex> lock(connections_mutex_);
+                for (const auto& pair : remote_connections_) {
+                    // If connected node is NOT in registry, it's dead
+                    if (registry_node_ids.find(pair.first) == registry_node_ids.end()) {
+                        dead_nodes.push_back(pair.first);
                     }
                 }
-
+            }
                 // Node was removed - trigger NODE_LEFT event
-                if (!found) {
-                    NEXUS_DEBUG("SHM-V3")
-                        << "Heartbeat timeout detected for node: " << node.node_id << ", triggering NODE_LEFT event";
-                    node_impl_->handleNodeEvent(node.node_id, false);
-                }
+            for (const auto& nid : dead_nodes) {
+                NEXUS_INFO("SHM-V3") << "Node " << nid << " missing from registry, triggering cleanup";
+                node_impl_->handleNodeEvent(nid, false);
             }
         }
 
