@@ -41,6 +41,35 @@ include_directories(
 # Backward compatibility: also include old paths
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+# ========================================
+# Logger Library (standalone)
+# ========================================
+add_library(nexus_logger src/utils/Logger.cpp)
+target_include_directories(nexus_logger PUBLIC 
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/nexus
+)
+
+# Make logger library shared if BUILD_SHARED_LIBS is ON
+if(BUILD_SHARED_LIBS)
+    set_target_properties(nexus_logger PROPERTIES
+        VERSION ${PROJECT_VERSION}
+        SOVERSION 3
+        OUTPUT_NAME "nexus_logger"
+        POSITION_INDEPENDENT_CODE ON
+    )
+else()
+    set_target_properties(nexus_logger PROPERTIES
+        OUTPUT_NAME "nexus_logger"
+        POSITION_INDEPENDENT_CODE ON
+    )
+endif()
+
+target_link_libraries(nexus_logger pthread)
+
+# ========================================
+# Main Nexus Library
+# ========================================
 # Source files organized by module
 set(NEXUS_CORE_SOURCES
     src/core/Config.cpp
@@ -58,16 +87,11 @@ set(NEXUS_REGISTRY_SOURCES
     src/registry/GlobalRegistry.cpp
 )
 
-set(NEXUS_UTILS_SOURCES
-    src/utils/Logger.cpp
-)
-
-# Combine all sources
+# Combine all sources (Logger is now in separate library)
 set(NEXUS_SOURCES
     ${NEXUS_CORE_SOURCES}
     ${NEXUS_TRANSPORT_SOURCES}
     ${NEXUS_REGISTRY_SOURCES}
-    ${NEXUS_UTILS_SOURCES}
 )
 
 # Create library
@@ -87,6 +111,7 @@ endif()
 
 # Link libraries
 target_link_libraries(nexus
+    nexus_logger
     pthread
     rt
 )
@@ -100,7 +125,7 @@ target_compile_options(nexus PRIVATE
 )
 
 # Installation
-install(TARGETS nexus
+install(TARGETS nexus nexus_logger
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
 )
@@ -133,28 +158,28 @@ if(BUILD_TESTS)
     
     foreach(test ${INTEGRATION_TESTS})
         add_executable(${test} tests/integration/${test}.cpp)
-        target_link_libraries(${test} nexus pthread rt)
+        target_link_libraries(${test} nexus nexus_logger pthread rt)
         add_test(NAME ${test} COMMAND ${test})
     endforeach()
     
     # Large data channel tests (require two processes)
     add_executable(test_large_sender tests/integration/test_large_sender.cpp)
-    target_link_libraries(test_large_sender nexus pthread rt)
+    target_link_libraries(test_large_sender nexus nexus_logger pthread rt)
     
     add_executable(test_large_receiver tests/integration/test_large_receiver.cpp)
-    target_link_libraries(test_large_receiver nexus pthread rt)
+    target_link_libraries(test_large_receiver nexus nexus_logger pthread rt)
     
     # Special test for service cleanup verification
     add_executable(test_service_cleanup test_service_cleanup.cpp)
-    target_link_libraries(test_service_cleanup nexus pthread rt)
+    target_link_libraries(test_service_cleanup nexus nexus_logger pthread rt)
     
     # Long-term stability test
     add_executable(test_long_term_stability tests/stability/test_long_term_stability.cpp)
-    target_link_libraries(test_long_term_stability nexus pthread rt)
+    target_link_libraries(test_long_term_stability nexus nexus_logger pthread rt)
     
     # Polling overhead test
     add_executable(test_polling_overhead tests/stability/test_polling_overhead.cpp)
-    target_link_libraries(test_polling_overhead nexus pthread rt)
+    target_link_libraries(test_polling_overhead nexus nexus_logger pthread rt)
     
     # Unit Tests
     set(UNIT_TEST_SOURCES
@@ -206,7 +231,7 @@ if(BUILD_TESTS)
 
     add_executable(unit_tests ${UNIT_TEST_SOURCES})
     target_include_directories(unit_tests PRIVATE tests/unit)
-    target_link_libraries(unit_tests nexus pthread rt)
+    target_link_libraries(unit_tests nexus nexus_logger pthread rt)
     add_test(NAME unit_tests COMMAND unit_tests)
 
     message(STATUS "Test programs will be built")

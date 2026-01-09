@@ -14,11 +14,14 @@ TEST(TransportStress, NotifyMechanisms) {
         SharedMemoryTransportV3::Config config;
         config.notify_mechanism = SharedMemoryTransportV3::NotifyMechanism::SEMAPHORE;
         
-        ASSERT_TRUE(t1.initialize("sem_node1", config));
-        ASSERT_TRUE(t2.initialize("sem_node2", config));
+        ASSERT_TRUE(t1.initialize("proc_sem1", config));
+        ASSERT_TRUE(t1.registerNodeToRegistry("sem_node1"));
+
+        ASSERT_TRUE(t2.initialize("proc_sem2", config));
+        ASSERT_TRUE(t2.registerNodeToRegistry("sem_node2"));
         
         std::atomic<int> received{0};
-        t2.setReceiveCallback([&](const uint8_t*, size_t, const std::string&) { received++; });
+        t2.addReceiveCallback("sem_node2", [&](const uint8_t*, size_t, const std::string&) { received++; });
         t2.startReceiving();
         
         std::string msg = "sem_msg";
@@ -37,11 +40,14 @@ TEST(TransportStress, NotifyMechanisms) {
         SharedMemoryTransportV3::Config config;
         config.notify_mechanism = SharedMemoryTransportV3::NotifyMechanism::SMART_POLLING;
         
-        ASSERT_TRUE(t1.initialize("poll_node1", config));
-        ASSERT_TRUE(t2.initialize("poll_node2", config));
+        ASSERT_TRUE(t1.initialize("proc_poll1", config));
+        ASSERT_TRUE(t1.registerNodeToRegistry("poll_node1"));
+
+        ASSERT_TRUE(t2.initialize("proc_poll2", config));
+        ASSERT_TRUE(t2.registerNodeToRegistry("poll_node2"));
         
         std::atomic<int> received{0};
-        t2.setReceiveCallback([&](const uint8_t*, size_t, const std::string&) { received++; });
+        t2.addReceiveCallback("poll_node2", [&](const uint8_t*, size_t, const std::string&) { received++; });
         t2.startReceiving();
         
         std::string msg = "poll_msg";
@@ -61,8 +67,11 @@ TEST(TransportStress, Congestion) {
     // it uses fixed compile-time constant QUEUE_CAPACITY = 256.
     // So we need to send more than 256 messages to trigger congestion.
     
-    ASSERT_TRUE(t1.initialize("cong_node1", config));
-    ASSERT_TRUE(t2.initialize("cong_node2", config));
+    ASSERT_TRUE(t1.initialize("proc_cong1", config));
+    ASSERT_TRUE(t1.registerNodeToRegistry("cong_node1"));
+
+    ASSERT_TRUE(t2.initialize("proc_cong2", config));
+    ASSERT_TRUE(t2.registerNodeToRegistry("cong_node2"));
     
     // Don't start receiving yet to fill queue
     
@@ -99,7 +108,7 @@ TEST(TransportStress, Congestion) {
     std::vector<int> received_ids;
     std::mutex received_mutex;
 
-    t2.setReceiveCallback([&](const uint8_t* d, size_t, const std::string&) { 
+    t2.addReceiveCallback("cong_node2", [&](const uint8_t* d, size_t, const std::string&) { 
         received++; 
         std::lock_guard<std::mutex> lock(received_mutex);
         if (d) {
@@ -140,7 +149,8 @@ TEST(TransportStress, QueueLimit) {
     SharedMemoryTransportV3::Config config;
     config.max_inbound_queues = 5; // Set low limit
     
-    ASSERT_TRUE(receiver.initialize("limit_recv", config));
+    ASSERT_TRUE(receiver.initialize("proc_limit_recv", config));
+    ASSERT_TRUE(receiver.registerNodeToRegistry("limit_recv"));
     
     std::vector<std::unique_ptr<SharedMemoryTransportV3>> senders;
     int success_count = 0;
@@ -148,8 +158,12 @@ TEST(TransportStress, QueueLimit) {
     // Try to connect 10 senders
     for(int i=0; i<10; ++i) {
         auto sender = std::make_unique<SharedMemoryTransportV3>();
-        std::string id = "limit_sender_" + std::to_string(i);
-        if(sender->initialize(id)) {
+        std::string node_id = "limit_sender_" + std::to_string(i);
+        std::string proc_id = "proc_" + node_id;
+
+        if(sender->initialize(proc_id)) {
+            sender->registerNodeToRegistry(node_id);
+
             // Try to send to receiver (triggers queue creation)
             std::string msg = "hello";
             // Wait a bit for registry propagation
@@ -169,15 +183,18 @@ TEST(TransportStress, QueueLimit) {
 
 TEST(TransportStress, DynamicQueueAddition) {
     SharedMemoryTransportV3 receiver;
-    ASSERT_TRUE(receiver.initialize("dyn_recv"));
+    ASSERT_TRUE(receiver.initialize("proc_dyn_recv"));
+    ASSERT_TRUE(receiver.registerNodeToRegistry("dyn_recv"));
     
     std::atomic<int> received{0};
-    receiver.setReceiveCallback([&](const uint8_t*, size_t, const std::string&) { received++; });
+    receiver.addReceiveCallback("dyn_recv", [&](const uint8_t*, size_t, const std::string&) { received++; });
     receiver.startReceiving();
     
     // Add sender 1
     SharedMemoryTransportV3 s1;
-    ASSERT_TRUE(s1.initialize("dyn_s1"));
+    ASSERT_TRUE(s1.initialize("proc_dyn_s1"));
+    ASSERT_TRUE(s1.registerNodeToRegistry("dyn_s1"));
+
     std::string msg = "msg1";
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     ASSERT_TRUE(s1.send("dyn_recv", (const uint8_t*)msg.data(), msg.size()));
@@ -188,7 +205,9 @@ TEST(TransportStress, DynamicQueueAddition) {
     
     // Add sender 2 while receiving
     SharedMemoryTransportV3 s2;
-    ASSERT_TRUE(s2.initialize("dyn_s2"));
+    ASSERT_TRUE(s2.initialize("proc_dyn_s2"));
+    ASSERT_TRUE(s2.registerNodeToRegistry("dyn_s2"));
+
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     ASSERT_TRUE(s2.send("dyn_recv", (const uint8_t*)msg.data(), msg.size()));
     
@@ -203,6 +222,10 @@ TEST(TransportStress, ExplicitDisconnect) {
     SharedMemoryTransportV3 t1, t2;
     ASSERT_TRUE(t1.initialize("disc_node1"));
     ASSERT_TRUE(t2.initialize("disc_node2"));
+    
+    // Register nodes to ensure they exist in registry
+    ASSERT_TRUE(t1.registerNodeToRegistry("disc_node1"));
+    ASSERT_TRUE(t2.registerNodeToRegistry("disc_node2"));
     
     std::string msg = "hello";
     // Connect
@@ -237,6 +260,7 @@ TEST(TransportStress, Stats) {
     SharedMemoryTransportV3::Config config;
     config.enable_stats = true;
     ASSERT_TRUE(t.initialize("stats_node", config));
+    ASSERT_TRUE(t.registerNodeToRegistry("stats_node"));
     
     auto stats = t.getStats();
     ASSERT_EQ(stats.messages_sent, 0);
@@ -246,6 +270,7 @@ TEST(TransportStress, Stats) {
     // But we can send to another node
     SharedMemoryTransportV3 t2;
     ASSERT_TRUE(t2.initialize("stats_node2", config));
+    ASSERT_TRUE(t2.registerNodeToRegistry("stats_node2"));
     t2.startReceiving();
     
     std::string msg = "stats";

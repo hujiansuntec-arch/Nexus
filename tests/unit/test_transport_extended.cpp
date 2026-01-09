@@ -12,14 +12,19 @@ TEST(SharedMemoryTransportExtendedTest, PointToPoint) {
     SharedMemoryTransportV3 t1;
     SharedMemoryTransportV3 t2;
     
-    ASSERT_TRUE(t1.initialize("node1"));
-    ASSERT_TRUE(t2.initialize("node2"));
+    // Transport initialization with process-level ID
+    ASSERT_TRUE(t1.initialize("proc_t1"));
+    ASSERT_TRUE(t1.registerNodeToRegistry("node1"));
+    
+    ASSERT_TRUE(t2.initialize("proc_t2"));
+    ASSERT_TRUE(t2.registerNodeToRegistry("node2"));
     
     std::atomic<int> received_count{0};
     std::string last_msg;
     std::string last_sender;
     
-    t2.setReceiveCallback([&](const uint8_t* data, size_t size, const std::string& from) {
+    // Register callback for node2
+    t2.addReceiveCallback("node2", [&](const uint8_t* data, size_t size, const std::string& from) {
         last_msg.assign(reinterpret_cast<const char*>(data), size);
         last_sender = from;
         received_count++;
@@ -38,7 +43,10 @@ TEST(SharedMemoryTransportExtendedTest, PointToPoint) {
     
     ASSERT_EQ(1, received_count);
     ASSERT_EQ(msg, last_msg);
-    ASSERT_EQ("node1", last_sender);
+    // In V3 Process-Level Transport, the sender is identified by the Transport ID (Process ID),
+    // not the individual Node ID. The Node ID is contained within the message payload (packet header),
+    // which this raw test doesn't use.
+    ASSERT_EQ("proc_t1", last_sender);
     
     t2.stopReceiving();
 }
@@ -48,15 +56,20 @@ TEST(SharedMemoryTransportExtendedTest, Broadcast) {
     SharedMemoryTransportV3 t2;
     SharedMemoryTransportV3 t3;
     
-    ASSERT_TRUE(t1.initialize("b_node1"));
-    ASSERT_TRUE(t2.initialize("b_node2"));
-    ASSERT_TRUE(t3.initialize("b_node3"));
+    ASSERT_TRUE(t1.initialize("proc_b1"));
+    ASSERT_TRUE(t1.registerNodeToRegistry("b_node1"));
+    
+    ASSERT_TRUE(t2.initialize("proc_b2"));
+    ASSERT_TRUE(t2.registerNodeToRegistry("b_node2"));
+    
+    ASSERT_TRUE(t3.initialize("proc_b3"));
+    ASSERT_TRUE(t3.registerNodeToRegistry("b_node3"));
     
     std::atomic<int> count2{0};
     std::atomic<int> count3{0};
     
-    t2.setReceiveCallback([&](const uint8_t*, size_t, const std::string&) { count2++; });
-    t3.setReceiveCallback([&](const uint8_t*, size_t, const std::string&) { count3++; });
+    t2.addReceiveCallback("b_node2", [&](const uint8_t*, size_t, const std::string&) { count2++; });
+    t3.addReceiveCallback("b_node3", [&](const uint8_t*, size_t, const std::string&) { count3++; });
     
     t2.startReceiving();
     t3.startReceiving();

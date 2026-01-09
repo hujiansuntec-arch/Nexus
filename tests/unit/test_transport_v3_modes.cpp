@@ -25,7 +25,8 @@ TEST(TransportV3Modes, SemaphoreMode) {
     SharedMemoryTransportV3 receiver;
     SharedMemoryTransportV3::Config config;
     config.notify_mechanism = SharedMemoryTransportV3::NotifyMechanism::SEMAPHORE;
-    ASSERT_TRUE(receiver.initialize("sem_recv", config));
+    ASSERT_TRUE(receiver.initialize("proc_sem_recv", config));
+    ASSERT_TRUE(receiver.registerNodeToRegistry("sem_recv"));
     
     // Start receiving
     receiver.startReceiving();
@@ -34,7 +35,7 @@ TEST(TransportV3Modes, SemaphoreMode) {
     SharedMemoryTransportV3 sender;
     // Sender MUST use the same mechanism because the mechanism is decided by the sender's config
     // when creating the queue in the receiver's shared memory.
-    ASSERT_TRUE(sender.initialize("sem_send", config));
+    ASSERT_TRUE(sender.initialize("proc_sem_send", config));
     
     // 3. Send data
     std::vector<uint8_t> data = {1, 2, 3};
@@ -62,13 +63,14 @@ TEST(TransportV3Modes, SmartPollingMode) {
     SharedMemoryTransportV3 receiver;
     SharedMemoryTransportV3::Config config;
     config.notify_mechanism = SharedMemoryTransportV3::NotifyMechanism::SMART_POLLING;
-    ASSERT_TRUE(receiver.initialize("poll_recv", config));
+    ASSERT_TRUE(receiver.initialize("proc_poll_recv", config));
+    ASSERT_TRUE(receiver.registerNodeToRegistry("poll_recv"));
     
     receiver.startReceiving();
     
     // 2. Create Sender
     SharedMemoryTransportV3 sender;
-    ASSERT_TRUE(sender.initialize("poll_send", config));
+    ASSERT_TRUE(sender.initialize("proc_poll_send", config));
     
     // 3. Send data
     std::vector<uint8_t> data = {4, 5, 6};

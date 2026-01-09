@@ -91,6 +91,66 @@ cmake --install .
 | `BUILD_EXAMPLES` | ON | 构建示例程序 |
 | `CMAKE_INSTALL_PREFIX` | ./install | 安装路径 |
 
+## 🏗️ 库结构说明
+
+### 独立库：nexus_logger
+
+从 v3.0 开始，Logger 模块被分离为独立的共享库 `libnexus_logger.so`，支持测试程序和用户应用直接使用。
+
+**编译配置**（CMakeLists.txt Lines 42-71）：
+```cmake
+# Logger Library (standalone)
+add_library(nexus_logger src/utils/Logger.cpp)
+target_include_directories(nexus_logger PUBLIC 
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/nexus
+)
+
+if(BUILD_SHARED_LIBS)
+    set_target_properties(nexus_logger PROPERTIES
+        VERSION 3.0.0
+        SOVERSION 3
+        OUTPUT_NAME "nexus_logger"
+        POSITION_INDEPENDENT_CODE ON
+    )
+endif()
+
+target_link_libraries(nexus_logger pthread)
+```
+
+**编译产物**：
+```
+build/
+├── libnexus_logger.so.3.0.0  # Logger完整版本库
+├── libnexus_logger.so.3      # 主版本符号链接
+├── libnexus_logger.so        # 开发符号链接
+├── libnexus.so.3.0.0         # Nexus主库（依赖logger）
+├── libnexus.so.3
+└── libnexus.so
+```
+
+**依赖关系**：
+- `libnexus.so` → `libnexus_logger.so` + pthread + rt
+- `test_duplex_v2` → `libnexus.so` + `libnexus_logger.so`
+
+**单独编译Logger库**：
+```bash
+cd build
+make nexus_logger  # 只编译Logger库
+
+# 验证
+ls -lh libnexus_logger.so*
+# libnexus_logger.so -> libnexus_logger.so.3
+# libnexus_logger.so.3 -> libnexus_logger.so.3.0.0
+# libnexus_logger.so.3.0.0
+
+# 查看依赖
+ldd libnexus_logger.so
+# linux-vdso.so.1
+# libpthread.so.0 => /lib/x86_64-linux-gnu/libpthread.so.0
+# libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6
+```
+
 ## 🧪 运行测试
 
 ```bash
@@ -99,11 +159,55 @@ cd build
 # 设置库路径（如果使用共享库）
 export LD_LIBRARY_PATH=$(pwd):$LD_LIBRARY_PATH
 
+# 配置日志级别（可选）
+export NEXUS_LOG_LEVEL=INFO  # DEBUG/INFO/WARN/ERROR/NONE
+
 # 运行测试
 ./test_inprocess
 ./test_duplex_v2
 ./test_memory_config
 ./test_heartbeat_timeout
+
+# 使用测试脚本（推荐）
+cd ..
+./run_dnexus_logger.so.3.0.0    # Logger独立库（新增）
+├── libnexus_logger.so.3
+├── libnexus_logger.so
+├── libnexus.so.3.0.0           # Nexus主库
+├── libnexus.so.3
+├── libnexus.so
+├── test_inprocess              # 测试程序（链接logger）
+├── test_duplex_v2
+├── test_memory_config
+└── ...
+
+install/                        # cmake --install . 的输出
+├── lib/
+│   ├── libnexus_logger.so.3.0.0
+│   ├── libnexus_logger.so.3
+│   ├── libnexus_logger.so
+│   ├── libnexus.so.3.0.0
+│   ├── libnexus.so.3
+│   └── libnexus.so
+└── include/
+    └── nexus/
+        ├── core/
+        │   └── Node.h
+        ├── transport/
+        │   └── SharedMemoryTransportV3.h
+        ├── utils/
+        │   └── Logger.h            # Logger公共头文件
+# 只显示关键信息（生产环境推荐）
+export NEXUS_LOG_LEVEL=INFO
+./run_duplex_test.sh multi 5 256 500 2 2
+
+# 只显示错误
+export NEXUS_LOG_LEVEL=ERROR
+./run_duplex_test.sh multi 5 256 500 2 2
+
+# 禁用日志（性能测试）
+export NEXUS_LOG_LEVEL=NONE
+./run_duplex_test.sh multi 20 256 1000 2 4
 ```
 
 ## 📂 构建输出

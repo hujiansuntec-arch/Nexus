@@ -178,7 +178,11 @@ private:
 
     // Transport layers
     std::unique_ptr<UdpTransport> udp_transport_;                // For remote communication
-    std::unique_ptr<SharedMemoryTransportV3> shm_transport_v3_;  // For local communication (dynamic)
+    std::shared_ptr<SharedMemoryTransportV3> shm_transport_v3_;  // For local communication (dynamic)
+
+    // 🔧 Implement Process-Level Shared Transport architecture
+    static std::weak_ptr<SharedMemoryTransportV3> shared_transport_s;  // Singleton transport instance per process
+    static std::mutex shared_transport_mutex_s;                        // Mutex for creating shared transport
 
     // Large data channels: channel_name -> LargeDataChannel
     mutable std::mutex large_channels_mutex_;

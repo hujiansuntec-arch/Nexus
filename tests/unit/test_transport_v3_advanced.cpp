@@ -206,6 +206,7 @@ TEST(TransportV3AdvancedTest, QueueLimitReached) {
     SharedMemoryTransportV3::Config config;
     config.max_inbound_queues = 1;
     ASSERT_TRUE(receiver.initialize("limit_recv", config));
+    ASSERT_TRUE(receiver.registerNodeToRegistry("limit_recv"));
     
     // 2. Connect Sender 1 (Should succeed)
     SharedMemoryTransportV3 sender1;

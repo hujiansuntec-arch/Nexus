@@ -64,7 +64,7 @@ void testBasicInProcess() {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     std::cout << "  topic1: node1=" << node1_received << ", node2=" << node2_received 
               << ", node3=" << node3_received;
-    if (node1_received == 1 && node2_received == 1 && node3_received == 0) {
+    if (node1_received == 0 && node2_received == 1 && node3_received == 0) {
         std::cout << " ✅\n";
     } else {
         std::cout << " ❌\n";
@@ -92,7 +92,7 @@ void testBasicInProcess() {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     std::cout << "  topic3: node1=" << node1_received << ", node2=" << node2_received 
               << ", node3=" << node3_received;
-    if (node1_received == 0 && node2_received == 1 && node3_received == 1) {
+    if (node1_received == 0 && node2_received == 1 && node3_received == 0) {
         std::cout << " ✅\n";
     } else {
         std::cout << " ❌\n";

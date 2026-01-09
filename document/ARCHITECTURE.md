@@ -120,6 +120,7 @@ Nexus 是一个高性能进程间通信框架，设计目标包括：
 | **LargeDataChannel** | 大数据专用通道 | LargeDataChannel.cpp |
 | **Registry** | 节点注册与发现 | SharedMemoryRegistry.cpp |
 | **LockFreeQueue** | 无锁环形队列 | LockFreeQueue.h |
+| **Logger** | 统一日志系统（独立库） | Logger.h, Logger.cpp |
 
 ---
 
@@ -159,12 +160,35 @@ class NodeImpl {
 
 #### 3.2.1 架构设计
 
+**核心原理：一个进程 = 一块共享内存 = 进程内所有Node共享**
+
+每个**进程**创建一块共享内存区域用于**接收**消息，该进程内的所有Node共享这块内存。这块共享内存包含多个InboundQueue（入站队列），每个队列专门用于接收来自一个特定**发送进程**的消息。
+
+**关键设计**：
+- 🔑 **1个进程 → 1块共享内存**（用于接收，基于PID命名）
+- 🔑 **1块共享内存 → 最多32/64个InboundQueue**（可配置）
+- 🔑 **1个InboundQueue → 1个发送进程**（SPSC队列）
+- 🔑 **同一进程内的多个Node → 共享这块内存接收消息**
+- 🔑 **多个发送进程 → 同一个接收进程的不同队列**
+
+**通信模型**：
+```
+发送者视角：
+  进程A的NodeX发送 → 查找进程B的共享内存 → 找到专属队列 → 写入
+
+接收者视角：
+  进程B创建共享内存（所有Node共享） → 包含多个入站队列 → 分别接收来自不同发送进程的消息
+  进程B的NodeY和NodeZ都从这块共享内存读取各自订阅的消息
+```
+
 ```
 ┌────────────────────────────────────────────────────────┐
 │                  /dev/shm/librpc_registry              │
 │  ┌──────────────────────────────────────────────────┐  │
-│  │  Node0: "app_A" -> /librpc_node_12345_abc123    │  │
-│  │  Node1: "app_B" -> /librpc_node_67890_def456    │  │
+│  │  Node0: "app_A" -> /librpc_process_12345        │  │
+│  │  Node1: "app_B" -> /librpc_process_12345        │  │ (同进程)
+│  │  Node2: "app_C" -> /librpc_process_67890        │  │
+│  │  Node3: "app_D" -> /librpc_process_67890        │  │ (同进程)
 │  │  ...                                             │  │
 │  └──────────────────────────────────────────────────┘  │
 └────────────────────────────────────────────────────────┘
@@ -175,8 +199,10 @@ class NodeImpl {
         │                             │
 ┌───────▼──────────────┐      ┌───────▼──────────────┐
 │ /dev/shm/            │      │ /dev/shm/            │
-│ librpc_node_12345_   │      │ librpc_node_67890_   │
-│ abc123               │      │ def456               │
+│ librpc_process_12345 │      │ librpc_process_67890 │
+│                      │      │                      │
+│ (进程A的接收内存)     │      │ (进程B的接收内存)     │
+│ NodeA和NodeB共享     │      │ NodeC和NodeD共享     │
 │                      │      │                      │
 │ ┌──────────────────┐ │      │ ┌──────────────────┐ │
 │ │ NodeHeader       │ │      │ │ NodeHeader       │ │
@@ -185,19 +211,40 @@ class NodeImpl {
 │ │  • owner_pid ✓   │ │      │ │  • owner_pid ✓   │ │
 │ │  • heartbeat ✓   │ │      │ │  • heartbeat ✓   │ │
 │ └──────────────────┘ │      │ └──────────────────┘ │
-│                      │      │                      │
-│ ┌──────────────────┐ │      │ ┌──────────────────┐ │
-│ │ InboundQueue[0]  │ │      │ │ InboundQueue[0]  │ │
-│ │  from: "app_B"   │ │      │ │  from: "app_A"   │ │
-│ │  queue: SPSC     │ │      │ │  queue: SPSC     │ │
-│ │  (256 slots)     │ │      │ │  (256 slots)     │ │
-│ └──────────────────┘ │      │ └──────────────────┘ │
-│ │ InboundQueue[1]  │ │      │ │ InboundQueue[1]  │ │
-│ │  ...             │ │      │ │  ...             │ │
-│ └──────────────────┘ │      │ └──────────────────┘ │
-│ [最多32个队列]        │      │ [最多32个队列]        │
-└──────────────────────┘      └──────────────────────┘
-```
+│           process_ │ │      │ │  from: "process_ │ │
+│ │        67890"    │ │◄─────┼──┼─ 进程B写入这里   │ │
+│ │  queue: SPSC     │ │      │ │        12345"    │ │◄── 进程A写入这里
+│ │  (256 slots)     │ │      │ │  queue: SPSC     │ │
+│ └──────────────────┘ │      │ │  (256 slots)     │ │
+│ │ InboundQueue[1]  │ │      │ └──────────────────┘ │
+│ │  from: "process_ │ │      │ │ InboundQueue[1]  │ │
+│ │        99999"    │ │◄─────┼──┼─ 进程C写入这里   │ │
+│ │  ...             │ │      │ │  from: "process_ │ │
+│ └──────────────────┘ │      │ │        88888"    │ │
+│ [最多32个队列]        │      │ │  ...             │ │
+│ [每队列对应1个发送    │      │ └──────────────────┘ │
+│  进程，不是node]      │      │ [最多32个队列]        │
+└──────────────────────┘      │ [每队列对应1个发送    │
+                              │  进程，不是node]        │ │
+│ [每队列对应1个发送者] │      │ └──────────────────┘ │
+└─进程A（PID=12345）的共享内存有32个InboundQueue槽位
+- 进程A内创建了NodeX和NodeY，它们共享这块内存
+- 进程B（PID=67890）向进程A发送消息时，找到进程A的共享内存（librpc_process_12345），在其中分配一个专属队列（InboundQueue[0]）
+- 进程C（PID=99999）向进程A发送消息时，也在进程A的共享内存中分配另一个队列（InboundQueue[1]）
+- 进程A的NodeX和NodeY都从这块共享内存读取消息，根据topic路由到各自的订阅回调
+
+**优势**：
+- ✅ 发送者无锁写入（SPSC队列，单生产者单消费者，进程级别）
+- ✅ 接收者按需分配队列（最多支持32/64个发送进程）
+- ✅ 同一进程多个Node共享内存（节省资源）
+- ✅ 缓存行对齐（避免伪共享）
+- ✅ 动态扩展（新发送进程遍历自己的所有活跃队列，批量处理
+
+**优势**：
+- ✅ 发送者无锁写入（SPSC队列，单生产者单消费者）
+- ✅ 接收者按需分配队列（最多支持32/64个发送者）
+- ✅ 缓存行对齐（避免伪共享）
+- ✅ 动态扩展（新发送者自动分配队列）
 
 #### 3.2.2 数据结构（优化后）
 
@@ -656,11 +703,270 @@ while (retry < 10) {
     retry++;
 }
 ```
+连接是**进程级别**的，同一进程的所有Node共享一个SharedMemoryTransport。
 
-**关键设计**：
-- ✅ O_EXCL原子创建（只有一个进程创建成功）
-- ✅ Release-Acquire语义（确保初始化顺序）
-- ✅ 重试机制（避免初始化窗口期的"Invalid magic"错误）
+#### 4.3.1 完整流程示例
+
+**场景**：进程A的NodeX（发送者）向进程B的NodeY（接收者）发送第一条消息
+
+```
+步骤1: 进程B启动，第一个Node创建共享内存
+┌─────────────────────────────────────┐
+│ 进程B (PID=67890)                   │
+│                                     │
+│ 1. createNode("node_B")（第一个）    │
+│    ├─ 创建进程级共享内存:            │
+│    │  /dev/shm/librpc_process_67890
+步骤1: Node B 启动并创建接收内存
+┌─────────────────────────────────────┐
+│ Node B (PID=67890)                  │
+│                                     │
+│ 1. createNode("node_B")             │
+│    ├─ 创建共享内存:                  │
+│    │  /dev/shm/librpc_node_         │
+│    │  67890_def456                  │
+│    │  ├─ NodeHeader (初始化)process_   │
+│    │             67890"             │
+│    │                                │
+│    └─ 启动receiveLoop()             │
+│       (等待消息...)                 │
+│                                     │
+│ 2. createNode("node_C")（第二个）    │
+│    ├─ 复用进程级共享内存            │
+│    │  (不再创建新的)                │
+│    └─ 注册到Registry:               │
+│       "node_C" → "librpc_process_   │
+│                  67890"（相同）     │
+└─────────────────────────────────────┘
+
+步骤2: 进程A启动
+┌─────────────────────────────────────┐
+│ 进程A (PID=12345)                   │
+│                                     │
+│ 1. createNode("node_A")（第一个）    │
+│    ├─ 创建进程级共享内存:            │
+│    进程A的NodeX首次发送消息给进程B
+┌─────────────────────────────────────┐
+│ 进程A的NodeX                        │
+│                                     │
+│ publish("group", "topic", data)     │
+│   ↓                                 │
+│ 1️⃣ 路由层判断                       │
+│   ├─ 查找订阅者 → 包含 node_B       │
+│   └─ node_B在其他进程？            │
+│       → 使用SharedMemoryTransport  │
+│       (进程级单例，进程A的所有Node   │
+│        共享这个Transport实例)       │
+│                                     │
+│ 2️⃣ 检查连接缓存（进程级）            │
+│   remote_connections_.find(PID=67890)│
+│   → 未找到 (首次连接到进程B)        │
+│                                     │
+│ 3️⃣ 从Registry查询进程B信息           │
+│   registry_.findNode("node_B")      │
+│   → shm_name: "librpc_process_67890"│
+│   → pid: 67890                      │
+│                                     │
+│ 4️⃣ 打开并映射进程B的共享内存          │
+│   fd = shm_open("librpc_process_    │
+│                  67890", O_RDWR)    │
+│   ptr = mmap(fd, 33MB,              │
+│              PROT_READ | PROT_WRITE)│
+│                                     │
+│ 5️⃣ 验证进程B共享内存已就绪            │
+│   ├─ magic == 0x4C525247 ✓         │
+│   └─ ready == true ✓                │
+│                                     │
+│ 6️⃣ 在进程B的共享内存中分配专属队列     │
+│   for (i = 0; i < max_queues; i++) {│
+│     InboundQueue& q = queues[i];   │
+│     // 查找空闲队列                 │
+│     if (q.flags == 0) {            │
+│       // 原子占用                  │
+│       if (CAS(q.flags, 0, 0x3)) {  │
+│         // 初始化队列              │
+│         strcpy(q.sender_id,        │
+│                "process_12345");   │ ← 存储进程ID
+│         pthread_cond_init(...);    │
+│         my_queue = &q;             │
+│         break;                     │
+│       }                            │
+│     }                              │
+│   }                                │
+│   → 成功分配 InboundQueue[0]       │
+│                                     │
+│ 7️⃣ 写入消息到专属队列                │
+│   my_queue->queue.tryWrite(        │
+│       node_id, data, size)         │ ← 消息包含目标node_id
+│   → 无锁写入（SPSC）                │
+│                                     │
+│ 8️⃣ 触发通知                         │
+│   prev = pending_msgs.fetch_add(1) │
+│   if (prev == 0) {  // 0→1触发     │
+│     pthread_cond_signal(           │
+│         &my_queue->notify_cond)    │
+│   }                                │
+│                                     │
+│ 9️⃣ 缓存连接信息（进程级，快速路径）    │
+│   remote_connections_[67890] = {   │
+│     .shm_ptr = ptr,                │
+│     .my_queue = my_queue,          │
+│     .pid = 67890                   │
+│   }                                │
+└─────────────────────────────────────┘
+
+步骤4: 进程B接收消息（所有Node共享）
+┌─────────────────────────────────────┐
+│ 进程B的receiveLoop（单例Transport）  │
+│                                     │
+│ receiveLoop() 被唤醒                │
+│   ↓                                 │
+│ 1️⃣ 刷新活跃队列列表                  │
+│   num = header.num_queues (=1)     │
+│   for (i = 0; i < num; i++) {      │
+│     if (queues[i].flags & 0x3)     │
+│       active_queues.push_back(&q); │
+│   }                                │
+│   → active_queues = [Queue[0]]     │
+│                                     │
+│ 2️⃣ 轮询活跃队列                     │
+│   for (q : active_queues) {        │
+│     while (q->queue.tryRead(       │
+│              target_node, data,    │
+│              size)) {              │
+│       // 读取成功                  │
+│       sender = "process_12345"     │
+│       target_node = "node_B"       │ ← 路由到具体Node
+│       topic = "topic"              │
+│       // 分发到目标Node的回调       │
+│       node_callbacks_[target_node] │
+│           (group, topic, data);    │
+│     }                              │
+│     q->pending_msgs--;             │
+│   }                                │
+│                                     │
+│ 3️⃣ NodeB和NodeC都可以接收各自的消息   │
+│   （根据target_node路由）           │
+└─────────────────────────────────────┘
+
+步骤5: 进程A再次发送（快速路径）
+┌─────────────────────────────────────┐
+│ 进程A的任意Node                      │
+│                                     │
+│ publish("group", "topic", data2)    │
+│   ↓                                 │
+│ 1️⃣ 检查连接缓存（进程级）            │
+│   remote_connections_.find(67890)  │
+│   → 找到！(已缓存)                  │
+│                                     │
+│ 2️⃣ 直接写入队列（无锁）              │
+│   conn.my_queue->queue.tryWrite(   │
+│       target_node, data2, size)
+步骤5: Node A 再次发送（快速路径）
+┌─────────────────────────────────────┐
+│ Node A      进程场景
+
+**场景**：进程A、进程C、进程D 都向进程B发送消息（进程B内有NodeY和NodeZ）
+
+```
+进程B的共享内存演进：
+
+时刻1: 初始状态（进程B刚启动）
+┌─────────────────────────────────┐
+│ 进程B: /dev/shm/librpc_process_67890 │
+│ 内含: NodeY, NodeZ              │
+│ ┌─ InboundQueue[0-31] ────────┐ │
+│ │ 全部未使用 (flags=0)         │ │
+│ │ num_queues = 0              │ │
+│ └─────────────────────────────┘ │
+└─────────────────────────────────┘
+
+时刻2: 进程A首次发送
+┌─────────────────────────────────┐
+│ ┌─ InboundQueue[0] ──────────┐  │
+│ │ sender_id: "process_12345" │  │ ← 进程A写入
+│ │ flags: 0x3 (valid|active)  │  │   (目标NodeY或NodeZ)
+│ │ pending_msgs: 1            │  │
+│ └────────────────────────────┘  │
+│ InboundQueue[1-31]: 未使用      │
+│ num_queues = 1                  │
+└─────────────────────────────────┘
+
+时刻3: 进程C首次发送
+┌─────────────────────────────────┐
+│ ┌─ InboundQueue[0] ──────────┐  │
+│ │ sender_id: "process_12345" │  │
+│ │ pending_msgs: 3            │  │
+│ └────────────────────────────┘  │
+│ ┌─ InboundQueue[1] ──────────┐  │
+│ │ sender_id: "process_99999" │  │ ← 进程C写入
+│ │ flags: 0x3                 │  │
+│ │ pending_msgs: 1            │  │
+│ └────────────────────────────┘  │
+│ InboundQueue[2-31]: 未使用      │
+│ num_queues = 2                  │
+└─────────────────────────────────┘
+
+时刻4: 进程D首次发送
+┌─────────────────────────────────┐
+│ ┌─ InboundQueue[0] ──────────┐  │
+│ │ sender_id: "process_12345" │  │
+│ │ pending_msgs: 5            │  │
+│ └────────────────────────────┘  │
+│ ┌─ InboundQueue[1] ──────────┐  │
+│ │ sender_id: "process_99999" │  │
+│ │ pending_msgs: 2            │  │
+│ └────────────────────────────┘  │
+│ ┌─ InboundQueue[2] ──────────┐  │
+│ │ sender_id: "process_88888" │  │ ← 进程D写入
+│ │ flags: 0x3                 │  │
+│ │ pending_msgs: 1            │  │
+│ └────────────────────────────┘  │
+│ InboundQueue[3-31]: 未使用      │
+│ num_queues = 3                  │
+└─────────────────────────────────┘
+```
+
+**进程B批量接收（NodeY和NodeZ共享）**：
+```
+receiveLoop() 一次循环处理：
+  - Queue[0] → 5条消息（来自进程A）
+    → 根据target_node分发给NodeY或NodeZ
+  - Queue[1] → 2条消息（来自进程C）
+    → 根据target_node分发给NodeY或NodeZ
+  - Queue[2] → 1条消息（来自进程D）
+    → 根据target_node分发给NodeY或NodeZ   │  │
+│ └────────────────────────────┘  │
+│ ┌─ InboundQueue[2] ──────────┐  │
+│ │ sender_id: "node_D"        │  │ ← NodeD写入
+│ │ flags: 0x3   进程独占SPSC队列 | 发送延迟~100ns |
+| **批量接收** | 轮询所有队列 | 减少系统调用 |
+| **动态扩展** | 按需分配队列 | 支持32/64个发送进程 |
+| **公平调度** | 轮询所有活跃队列 | 避免消息饥饿 |
+| **缓存友好** | 64字节对齐 | 避免伪共享 |
+| **懒惰连接** | 首次发送才映射 | 节省内存 |
+| **进程级共享** | 同一进程多Node共享Transport | 节省内存和资源───────┘
+```
+
+**NodeB批量接收**：
+```
+receiveLoop() 一次循环处理：
+  - Queue[0] → 5条消息（来自NodeA）
+  - Queue[1] → 2条消息（来自NodeC）
+  - Queue[2] → 1条消息（来自NodeD）
+  - 总计：8条消息，单次系统调用
+```
+
+#### 4.3.3 设计优势总结
+
+| 特性 | 实现方式 | 效果 |
+|-----|---------|------|
+| **无锁写入** | 每个发送者独占SPSC队列 | 发送延迟~100ns |
+| **批量接收** | 轮询所有队列 | 减少系统调用 |
+| **动态扩展** | 按需分配队列 | 支持32/64个发送者 |
+| **公平调度** | 轮询所有活跃队列 | 避免消息饥饿 |
+| **缓存友好** | 64字节对齐 | 避免伪共享 |
+| **懒惰连接** | 首次发送才映射 | 节省内存 |
 
 ### 4.3 Node连接机制（懒惰连接）
 
@@ -1319,5 +1625,435 @@ struct alignas(64) InboundQueue {
 
 ---
 
-**最后更新**: 2025-11-26  
+## 10. Logger模块设计
+
+### 10.1 概述
+
+**Nexus Logger** 是一个独立编译的日志库，提供线程安全、高性能的统一日志系统。从v3.0开始，Logger模块从主库中分离，编译为 `libnexus_logger.so`，支持测试程序和用户应用直接使用。
+
+#### 10.1.1 设计目标
+
+| 目标 | 实现方式 |
+|-----|---------|
+| **线程安全** | 全局单例 + mutex保护 |
+| **低开销** | 流式API + stringstream聚合 |
+| **灵活配置** | 环境变量 + 运行时设置 |
+| **独立部署** | 单独编译为共享库 |
+| **易于集成** | 简洁的宏接口 |
+
+### 10.2 架构设计
+
+#### 10.2.1 库结构
+
+```
+┌──────────────────────────────────────────────┐
+│          libnexus_logger.so                  │
+├──────────────────────────────────────────────┤
+│                                              │
+│  Logger (Singleton)                          │
+│  ├─ Level Management (DEBUG/INFO/WARN/ERROR) │
+│  ├─ Thread-safe Output (mutex)               │
+│  ├─ Timestamp Generation                     │
+│  └─ Component-based Filtering                │
+│                                              │
+│  LogStream (RAII)                            │
+│  ├─ Stream-style API (operator<<)            │
+│  ├─ Auto-flush on Destruction                │
+│  └─ Internal StringStream Buffer             │
+│                                              │
+└──────────────────────────────────────────────┘
+        ▲                        ▲
+        │                        │
+        │                        │
+┌───────┴────────┐      ┌────────┴──────────┐
+│  Main Library  │      │  Test Programs    │
+│  libnexus.so   │      │  test_duplex_v2   │
+│                │      │  test_inprocess   │
+└────────────────┘      └───────────────────┘
+```
+
+#### 10.2.2 编译配置
+
+```cmake
+# CMakeLists.txt (Lines 42-71)
+add_library(nexus_logger src/utils/Logger.cpp)
+
+# 公共头文件路径
+target_include_directories(nexus_logger PUBLIC 
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/nexus
+)
+
+# 共享库配置
+if(BUILD_SHARED_LIBS)
+    set_target_properties(nexus_logger PROPERTIES
+        VERSION ${PROJECT_VERSION}        # 3.0.0
+        SOVERSION 3                       # Major version
+        OUTPUT_NAME "nexus_logger"
+        POSITION_INDEPENDENT_CODE ON
+    )
+endif()
+
+# 链接pthread（互斥锁依赖）
+target_link_libraries(nexus_logger pthread)
+```
+
+**编译产物**：
+- `build/libnexus_logger.so.3.0.0` - 完整版本库
+- `build/libnexus_logger.so.3` - 主版本符号链接
+- `build/libnexus_logger.so` - 开发符号链接
+
+### 10.3 核心类设计
+
+#### 10.3.1 Logger类（单例模式）
+
+```cpp
+namespace Nexus::rpc {
+
+class Logger {
+public:
+    enum class Level { 
+        DEBUG = 0,  // 详细调试信息
+        INFO = 1,   // 一般信息
+        WARN = 2,   // 警告
+        ERROR = 3,  // 错误
+        NONE = 4    // 禁用日志
+    };
+    
+    // 获取全局单例
+    static Logger& instance();
+    
+    // 日志级别控制
+    void setLevel(Level level);
+    Level getLevel() const;
+    
+    // 格式控制
+    void setShowTimestamp(bool show);  // 默认: true
+    void setShowComponent(bool show);  // 默认: true
+    
+    // 核心日志接口
+    void log(Level level, const std::string& component, 
+             const std::string& message);
+
+private:
+    Logger();  // 私有构造函数
+    
+    Level min_level_{Level::INFO};  // 默认INFO级别
+    bool show_timestamp_{true};
+    bool show_component_{true};
+    mutable std::mutex mutex_;      // 线程安全保护
+};
+
+} // namespace Nexus::rpc
+```
+
+**环境变量配置**：
+```bash
+export NEXUS_LOG_LEVEL=DEBUG   # DEBUG/INFO/WARN/ERROR/NONE
+export NEXUS_LOG_LEVEL=ERROR   # 只显示错误
+export NEXUS_LOG_LEVEL=NONE    # 禁用日志
+```
+
+#### 10.3.2 LogStream类（流式API）
+
+```cpp
+class LogStream {
+public:
+    LogStream(Logger::Level level, const std::string& component)
+        : level_(level), component_(component) {}
+    
+    // RAII：析构时自动输出
+    ~LogStream() { 
+        Logger::instance().log(level_, component_, ss_.str()); 
+    }
+    
+    // 流式操作符重载
+    template <typename T>
+    LogStream& operator<<(const T& value) {
+        ss_ << value;
+        return *this;
+    }
+
+private:
+    Logger::Level level_;
+    std::string component_;
+    std::stringstream ss_;  // 内部缓冲区
+};
+```
+
+**优势**：
+- ✅ 自动聚合多次 `<<` 操作到单条日志
+- ✅ RAII自动管理mutex锁定时间
+- ✅ 避免多次lock/unlock开销
+
+### 10.4 API接口
+
+#### 10.4.1 宏定义（推荐使用）
+
+```cpp
+// 传统字符串宏
+#define NEXUS_LOG_DEBUG(component, msg)  \
+    Nexus::rpc::Logger::instance().log(Level::DEBUG, component, msg)
+
+#define NEXUS_LOG_INFO(component, msg)   \
+    Nexus::rpc::Logger::instance().log(Level::INFO, component, msg)
+
+#define NEXUS_LOG_WARN(component, msg)   \
+    Nexus::rpc::Logger::instance().log(Level::WARN, component, msg)
+
+#define NEXUS_LOG_ERROR(component, msg)  \
+    Nexus::rpc::Logger::instance().log(Level::ERROR, component, msg)
+
+// 流式宏（更灵活）
+#define NEXUS_DEBUG(component)  \
+    Nexus::rpc::LogStream(Nexus::rpc::Logger::Level::DEBUG, component)
+
+#define NEXUS_INFO(component)   \
+    Nexus::rpc::LogStream(Nexus::rpc::Logger::Level::INFO, component)
+
+#define NEXUS_WARN(component)   \
+    Nexus::rpc::LogStream(Nexus::rpc::Logger::Level::WARN, component)
+
+#define NEXUS_ERROR(component)  \
+    Nexus::rpc::LogStream(Nexus::rpc::Logger::Level::ERROR, component)
+```
+
+#### 10.4.2 使用示例
+
+**基础用法**：
+```cpp
+#include "nexus/utils/Logger.h"
+
+// 传统字符串方式
+NEXUS_LOG_INFO("NodeImpl", "Node initialized: node_123");
+
+// 流式方式（推荐）
+NEXUS_DEBUG("ShmV3") << "Sending message to " << dest_node 
+                     << ", size: " << size << " bytes";
+
+NEXUS_WARN("Registry") << "Node timeout: " << node_id 
+                       << ", last heartbeat: " << (now - last_hb) << "ms ago";
+
+NEXUS_ERROR("Transport") << "Failed to send message: " << error_msg;
+```
+
+**测试程序集成**（test_duplex_v2.cpp）：
+```cpp
+#include "nexus/utils/Logger.h"
+#include <sstream>
+
+// 全局互斥锁保护stdout（多线程环境）
+std::mutex g_cout_mutex;
+
+// 接收回调中使用DEBUG级别
+void onReceive(...) {
+    NEXUS_DEBUG("RecvCallback") << "[" << node_id_ << "] "
+                                << "Received from " << sender_id
+                                << ", topic: " << topic;
+}
+
+// 统计输出仍使用stdout（脚本解析）
+void printStatistics() {
+    std::ostringstream oss;
+    oss << "总发送: " << total_sent 
+        << " | 总接收: " << total_recv;
+    
+    {
+        std::lock_guard<std::mutex> lock(g_cout_mutex);
+        std::cout << oss.str() << std::endl;
+    }
+}
+```
+
+### 10.5 性能特性
+
+#### 10.5.1 线程安全机制
+
+| 组件 | 保护机制 | 说明 |
+|-----|---------|------|
+| **Logger::log()** | `std::mutex mutex_` | 全局互斥锁，保护cout/cerr输出 |
+| **LogStream** | RAII锁定 | 析构时调用log()，自动管理锁 |
+| **级别过滤** | 无锁判断 | 早期退出，避免不必要的锁竞争 |
+
+**示例流程**：
+```
+NEXUS_DEBUG("ShmV3") << "msg: " << data;
+   ↓
+1. 创建LogStream对象（栈上）
+   ↓
+2. operator<< 聚合到 stringstream（无锁）
+   ↓
+3. LogStream析构 → 调用Logger::log()
+   ↓
+4. 获取mutex → 检查级别 → 输出 → 释放mutex
+```
+
+#### 10.5.2 输出格式
+
+```
+[2025-11-28 14:32:45.123] [DEBUG] [ShmV3] Sending message to node_2, size: 256 bytes
+[2025-11-28 14:32:45.125] [INFO ] [Registry] Node registered: node_1 (/dev/shm/librpc_node_12345_abc)
+[2025-11-28 14:32:45.567] [WARN ] [Transport] Queue 80% full, sender: node_0
+[2025-11-28 14:32:45.890] [ERROR] [NodeImpl] Heartbeat timeout: node_3 (5200ms)
+│                        │ │       │ │         │
+│                        │ │       │ │         └─ 日志消息
+│                        │ │       │ └─ 组件名称
+│                        │ │       └─ 级别（5字符对齐）
+│                        │ └─ 时间戳（毫秒精度）
+```
+
+**格式控制**：
+```cpp
+Logger::instance().setShowTimestamp(false);  // 禁用时间戳
+Logger::instance().setShowComponent(false);  // 禁用组件名
+
+// 输出: [INFO ] Node registered: node_1
+```
+
+### 10.6 测试基础设施集成
+
+#### 10.6.1 Multi模式测试
+
+**run_duplex_test.sh** 支持多进程多节点通信测试：
+
+```bash
+# Multi模式用法
+./run_duplex_test.sh multi [duration] [msg_size] [rate] \
+                           [num_processes] [nodes_per_process] [topic]
+
+# 示例：2进程 × 4节点 = 8节点共享topic
+./run_duplex_test.sh multi 10 256 1000 2 4 shared_channel
+
+# 拓扑说明：
+# Process0: p0_node_0, p0_node_1, p0_node_2, p0_node_3
+# Process1: p1_node_0, p1_node_1, p1_node_2, p1_node_3
+# 
+# 所有8个节点订阅同一个topic，实现：
+# - 进程内通信（同进程节点之间）
+# - 跨进程通信（不同进程节点之间）
+```
+
+**通信放大效应**：
+- 每个节点发送N条消息
+- 每个节点接收 `(总节点数 - 1) × N` 条消息
+- 放大倍率 = `总节点数 - 1`
+- 示例：8节点系统 → 7.00x放大倍率
+
+**日志级别配置**：
+```bash
+export NEXUS_LOG_LEVEL=DEBUG    # 查看详细调试信息
+export NEXUS_LOG_LEVEL=INFO     # 生产环境推荐
+export NEXUS_LOG_LEVEL=ERROR    # 只显示错误
+```
+
+#### 10.6.2 测试日志输出示例
+
+```bash
+$ export NEXUS_LOG_LEVEL=DEBUG
+$ ./run_duplex_test.sh multi 5 128 500 2 3
+
+====================================
+全双工并发通信测试
+====================================
+测试模式: MULTI
+进程数量: 2 个
+每进程节点数: 3 个
+总节点数: 6 个
+订阅Topic: shared_channel
+====================================
+
+  启动进程 [process0]: 3 节点 (p0_node_0 ~ p0_node_2)
+  启动进程 [process1]: 3 节点 (p1_node_0 ~ p1_node_2)
+
+[2025-11-28 14:35:10.123] [DEBUG] [Registry] Registering node: p0_node_0
+[2025-11-28 14:35:10.125] [DEBUG] [ShmV3] Created inbound queue for p1_node_0
+[2025-11-28 14:35:10.567] [DEBUG] [RecvCallback] [p0_node_0] Received from p1_node_1, topic: shared_channel
+...
+
+====================================
+Multi模式测试完成！统计结果：
+====================================
+[process0] 发送: 2500 | 接收: 12500 | 放大倍率: 5.00x (预期: ~5x)
+[process1] 发送: 2500 | 接收: 12500 | 放大倍率: 5.00x (预期: ~5x)
+
+汇总统计
+====================================
+总发送量: 5000 消息
+总接收量: 25000 消息
+整体放大倍率: 5.00x
+
+✅ 测试成功：所有进程通信正常
+```
+
+### 10.7 部署与使用
+
+#### 10.7.1 库文件安装
+
+```bash
+# 编译Logger库
+mkdir -p build && cd build
+cmake -DBUILD_SHARED_LIBS=ON ..
+make nexus_logger
+
+# 安装到系统路径
+sudo cp libnexus_logger.so.3.0.0 /usr/local/lib/
+sudo ldconfig
+sudo cp -r ../include/nexus/utils/Logger.h /usr/local/include/nexus/utils/
+```
+
+#### 10.7.2 链接到用户应用
+
+```cmake
+# 用户CMakeLists.txt
+find_library(NEXUS_LOGGER_LIB nexus_logger)
+
+add_executable(my_app main.cpp)
+target_link_libraries(my_app ${NEXUS_LOGGER_LIB})
+```
+
+或直接链接：
+```cmake
+target_link_libraries(my_app nexus_logger)
+```
+
+#### 10.7.3 运行时配置
+
+```bash
+# 设置日志级别
+export NEXUS_LOG_LEVEL=DEBUG
+
+# 设置库路径（如果未安装到系统路径）
+export LD_LIBRARY_PATH=/path/to/build:$LD_LIBRARY_PATH
+
+# 运行应用
+./my_app
+```
+
+### 10.8 设计优势
+
+| 特性 | 传统方案 | Nexus Logger |
+|-----|---------|------------|
+| **库独立性** | 嵌入主库 | 独立编译，按需链接 |
+| **测试集成** | 测试程序难以使用 | 直接链接logger库 |
+| **线程安全** | 手动加锁 | 自动mutex保护 |
+| **性能开销** | 多次lock/unlock | 流式聚合，单次锁定 |
+| **级别过滤** | 运行时判断 | 环境变量 + 早期退出 |
+| **代码侵入** | 需要封装层 | 简洁宏接口 |
+
+### 10.9 最佳实践
+
+1. **生产环境**：设置 `NEXUS_LOG_LEVEL=INFO` 或 `WARN`
+2. **调试阶段**：设置 `NEXUS_LOG_LEVEL=DEBUG`
+3. **性能测试**：设置 `NEXUS_LOG_LEVEL=NONE` 或 `ERROR`
+4. **多线程环境**：
+   - 使用流式宏（`NEXUS_DEBUG`）避免多行输出交错
+   - 关键统计输出使用 `std::ostringstream` 聚合后输出
+5. **组件命名规范**：
+   - 传输层：`ShmV3`, `UDP`, `InProcess`
+   - 核心层：`NodeImpl`, `Registry`, `LargeData`
+   - 测试：`RecvCallback`, `SendThread`, `TestMain`
+
+---
+
+**最后更新**: 2025-11-28  
 **版本**: 3.0

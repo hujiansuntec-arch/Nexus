@@ -115,13 +115,15 @@ TEST(TransportV3CoverageFinal, ReceiveCallbackNull) {
     
     SharedMemoryTransportV3 transport;
     SharedMemoryTransportV3::Config config;
-    ASSERT_TRUE(transport.initialize("recv_null_cb", config));
+    ASSERT_TRUE(transport.initialize("proc_recv_null_cb", config));
+    ASSERT_TRUE(transport.registerNodeToRegistry("recv_null_cb"));
 
-    transport.setReceiveCallback(nullptr);
+    transport.removeReceiveCallback("recv_null_cb");
     transport.startReceiving();
 
     SharedMemoryTransportV3 sender;
-    ASSERT_TRUE(sender.initialize("sender_null_cb", config));
+    ASSERT_TRUE(sender.initialize("proc_sender_null_cb", config));
+    ASSERT_TRUE(sender.registerNodeToRegistry("sender_null_cb"));
     
     uint8_t data[] = "test";
     sender.send("recv_null_cb", data, sizeof(data));
@@ -397,8 +399,11 @@ TEST(TransportV3CoverageFinal, InitializeRegisterNodeFail) {
     SharedMemoryTransportV3 transport;
     SharedMemoryTransportV3::Config config;
     
-    // Should fail because registry is full
-    ASSERT_FALSE(transport.initialize("fail_node_reg_full", config));
+    // Initialize should succeed (creates SHM file)
+    ASSERT_TRUE(transport.initialize("fail_node_reg_full", config));
+    
+    // Register should fail because registry is full
+    ASSERT_FALSE(transport.registerNodeToRegistry("fail_node_reg_full_node"));
     
     cleanup_shm();
 }

@@ -14,6 +14,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "nexus/registry/SharedMemoryRegistry.h"
 #include "nexus/transport/LockFreeQueue.h"
@@ -42,6 +44,7 @@ class NodeImpl;
 class SharedMemoryTransportV3 {
 public:
     using ReceiveCallback = std::function<void(const uint8_t* data, size_t size, const std::string& from_node_id)>;
+    using NodeEventCallback = std::function<void(const std::string& node_id, bool is_joined)>;
 
     // 🔧 跨进程通知机制
     enum class NotifyMechanism {
@@ -57,7 +60,9 @@ public:
     static constexpr size_t DATA_QUEUE_SIZE_BYTES = 524288;
 
     static constexpr size_t QUEUE_CAPACITY = DATA_QUEUE_SIZE_BYTES;
-    static constexpr size_t MAX_INBOUND_QUEUES = 32;  // Max senders to this node (absolute limit, 降低到64)
+    // 🔧 Process-Level Transport: Increase queue limit to support multiple nodes sharing same transport
+    static constexpr size_t MAX_INBOUND_QUEUES = 64;  // Max senders to this process
+    static constexpr size_t MAX_ACCESSORS = 128;      // Max clients connected to this transport
 
     struct Config {
         size_t queue_capacity;
@@ -68,7 +73,7 @@ public:
 
         Config()
             : queue_capacity(QUEUE_CAPACITY),
-              max_inbound_queues(MAX_INBOUND_QUEUES)  // 默认32（进一步降低内存占用）
+              max_inbound_queues(MAX_INBOUND_QUEUES)
               ,
               enable_stats(true),
               auto_cleanup(true),
@@ -81,11 +86,25 @@ public:
 
     /**
      * @brief Initialize transport
-     * @param node_id Unique node identifier
+     * @param transport_id Unique identifier for the transport (usually process-based, e.g. "process_<PID>")
      * @param config Configuration
      * @return true if successful
      */
-    bool initialize(const std::string& node_id, const Config& config = Config());
+    bool initialize(const std::string& transport_id, const Config& config = Config());
+
+    /**
+     * @brief Register a specific node ID to this transport's shared memory
+     * @param node_id The logical Node ID to register
+     * @return true if successful
+     */
+    bool registerNodeToRegistry(const std::string& node_id);
+
+    /**
+     * @brief Unregister a specific node ID from this transport's shared memory
+     * @param node_id The logical Node ID to unregister
+     * @return true if successful
+     */
+    bool unregisterNodeFromRegistry(const std::string& node_id);
 
     /**
      * @brief Send data to specific node
@@ -105,9 +124,30 @@ public:
     int broadcast(const uint8_t* data, size_t size);
 
     /**
-     * @brief Set receive callback
+     * @brief Add receive callback for a specific node
+     * @param node_id The Node ID registering the callback
+     * @param callback Function to call when message arrives
      */
-    void setReceiveCallback(ReceiveCallback callback);
+    void addReceiveCallback(const std::string& node_id, ReceiveCallback callback);
+
+    /**
+     * @brief Remove receive callback for a specific node
+     * @param node_id The Node ID removing the callback
+     */
+    void removeReceiveCallback(const std::string& node_id);
+
+    /**
+     * @brief Add node event callback for a specific node
+     * @param node_id The Node ID registering the callback
+     * @param callback Function to call when node events occur
+     */
+    void addNodeEventCallback(const std::string& node_id, NodeEventCallback callback);
+
+    /**
+     * @brief Remove node event callback for a specific node
+     * @param node_id The Node ID removing the callback
+     */
+    void removeNodeEventCallback(const std::string& node_id);
 
     /**
      * @brief Start receiving thread
@@ -120,20 +160,16 @@ public:
     void stopReceiving();
 
     /**
-     * @brief Get node ID
+     * @brief Get transport ID
      */
-    std::string getNodeId() const { return node_id_; }
+    std::string getTransportId() const { return transport_id_; }
+
+
 
     /**
      * @brief Check if initialized
      */
     bool isInitialized() const { return initialized_; }
-
-    /**
-     * @brief Set NodeImpl pointer for heartbeat timeout notifications
-     * @param node_impl Pointer to NodeImpl instance
-     */
-    void setNodeImpl(NodeImpl* node_impl) { node_impl_ = node_impl; }
 
     /**
      * @brief Disconnect from a specific node
@@ -148,6 +184,12 @@ public:
      * @return Vector of active node IDs
      */
     std::vector<std::string> getLocalNodes() const;
+
+    /**
+     * @brief Get all registered node IDs across all processes
+     * @return Vector of all node IDs registered in SharedMemoryRegistry
+     */
+    std::vector<std::string> getAllRegisteredNodes() const;
 
     /**
      * @brief Check if a node is local (reachable via shared memory)
@@ -180,6 +222,13 @@ public:
      * @return Number of active nodes, or -1 if registry doesn't exist
      */
     static int getActiveNodeCount();
+
+    /**
+     * @brief Get the Shared Memory Name for a remote node (for optimization)
+     * @param node_id The remote Node ID
+     * @return The SHM name (e.g. process identifier) or empty if not found
+     */
+    std::string getRemoteShmName(const std::string& node_id);
 
     /**
      * @brief Transport statistics
@@ -287,14 +336,12 @@ private:
     static bool hasActiveAccessors(NodeHeader* header);
 
     // State
-    std::string node_id_;
+    std::string transport_id_;
     std::string my_shm_name_;
     Config config_;
     bool initialized_;
     NotifyMechanism notify_mechanism_;  // 当前使用的通知机制
-
-    // NodeImpl reference for heartbeat timeout notifications
-    NodeImpl* node_impl_;
+    
 
     // Registry
     SharedMemoryRegistry registry_;
@@ -312,7 +359,12 @@ private:
     std::thread receive_thread_;
     std::thread heartbeat_thread_;
     std::atomic<bool> receiving_;
-    ReceiveCallback receive_callback_;
+
+    // Callbacks & Local Node Management
+    std::unordered_map<std::string, ReceiveCallback> receive_callbacks_;
+    std::unordered_map<std::string, NodeEventCallback> node_event_callbacks_;
+    std::unordered_set<std::string> local_registered_nodes_;
+    mutable std::mutex callbacks_mutex_;
 
     // Condition variable for queue availability (used when active_queues is empty)
     std::mutex queue_wait_mutex_;

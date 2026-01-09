@@ -17,6 +17,9 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <vector>
+#include <unordered_set>
+#include <unordered_map>
 #include <sstream>  // For std::ostringstream
 #include <thread>   // For std::this_thread::sleep_for
 
@@ -91,7 +94,6 @@ SharedMemoryTransportV3::SharedMemoryTransportV3()
     : initialized_(false),
       notify_mechanism_(NotifyMechanism::CONDITION_VARIABLE)  // Must match declaration order in header
       ,
-      node_impl_(nullptr),
       my_shm_ptr_(nullptr),
       my_shm_fd_(-1),
       my_shm_(nullptr),
@@ -171,16 +173,19 @@ SharedMemoryTransportV3::~SharedMemoryTransportV3() {
 
     if (my_shm_ && my_shm_ptr_ && my_shm_ptr_ != MAP_FAILED) {
         removeAccessor(getpid());
-        NEXUS_INFO("SHM-V3") << "Removed accessor PID " << getpid() << " from node " << node_id_;
+        NEXUS_INFO("SHM-V3") << "Removed accessor PID " << getpid() << " from node " << transport_id_;
     } else {
-        NEXUS_WARN("SHM-V3") << "Cannot remove accessor PID from node " << node_id_ << ": "
+        NEXUS_WARN("SHM-V3") << "Cannot remove accessor PID from node " << transport_id_ << ": "
                              << "my_shm_=" << (void*)my_shm_ << ", my_shm_ptr_=" << (void*)my_shm_ptr_;
     }
 
     // Unregister from registry FIRST (prevents new connections)
     if (initialized_) {
-        NEXUS_DEBUG("SHM-V3") << "Unregistering node from registry: " << node_id_;
-        registry_.unregisterNode(node_id_);
+        std::lock_guard<std::mutex> lock(callbacks_mutex_);
+        for (const auto& node_id : local_registered_nodes_) {
+            NEXUS_DEBUG("SHM-V3") << "Unregistering node from registry: " << node_id;
+            registry_.unregisterNode(node_id);
+        }
     }
 
     // Strategy: Delayed cleanup after grace period
@@ -217,16 +222,16 @@ SharedMemoryTransportV3::~SharedMemoryTransportV3() {
         }
     }
 
-    NEXUS_DEBUG("SHM-V3") << "Node " << node_id_ << " destroyed";
+    NEXUS_DEBUG("SHM-V3") << "Node " << transport_id_ << " destroyed";
 }
 
-bool SharedMemoryTransportV3::initialize(const std::string& node_id, const Config& config) {
+bool SharedMemoryTransportV3::initialize(const std::string& transport_id, const Config& config) {
     if (initialized_) {
         return true;
     }
 
-    if (node_id.empty()) {
-        NEXUS_ERROR("SHM-V3") << "Invalid node ID";
+    if (transport_id.empty()) {
+        NEXUS_ERROR("SHM-V3") << "Invalid transport ID";
         return false;
     }
 
@@ -237,7 +242,7 @@ bool SharedMemoryTransportV3::initialize(const std::string& node_id, const Confi
         return false;
     }
 
-    node_id_ = node_id;
+    transport_id_ = transport_id;
     config_ = config;
     notify_mechanism_ = config.notify_mechanism;  // 保存通知机制配置
 
@@ -256,12 +261,8 @@ bool SharedMemoryTransportV3::initialize(const std::string& node_id, const Confi
         return false;
     }
 
-    // Register in registry
-    if (!registry_.registerNode(node_id_, my_shm_name_)) {
-        NEXUS_ERROR("SHM-V3") << "Failed to register node";
-        destroyMySharedMemory();
-        return false;
-    }
+    // Note: We do NOT register a node here. Individual nodes will call registerNodeToRegistry.
+    // The transport acts as a container.
 
     // 🔧 两阶段提交：设置ready标志
     my_shm_->header.ready.store(true, std::memory_order_release);
@@ -277,12 +278,48 @@ bool SharedMemoryTransportV3::initialize(const std::string& node_id, const Confi
         mechanism_name = "Smart Polling";
     }
 
-    NEXUS_INFO("SHM-V3") << "Node " << node_id_ << " initialized"
+    NEXUS_INFO("SHM-V3") << "Transport " << transport_id_ << " initialized"
                           << "\n  Notify mechanism: " << mechanism_name << "\n  Shared memory: " << my_shm_name_
                           << "\n  Queue capacity: " << config_.queue_capacity
                           << "\n  Max inbound queues: " << MAX_INBOUND_QUEUES;
 
+    NEXUS_INFO("SHM-V3") << "Layout Check: "
+        << "IQ_Size=" << sizeof(InboundQueue) 
+        << " D.Pend=" << offsetof(InboundQueue, data_pending) 
+        << " D.Queue=" << offsetof(InboundQueue, data_queue)
+        << " SemSize=" << sizeof(sem_t);
+
     return true;
+}
+
+bool SharedMemoryTransportV3::registerNodeToRegistry(const std::string& node_id) {
+    if (!initialized_) return false;
+    
+    // Register in registry
+    if (!registry_.registerNode(node_id, my_shm_name_)) {
+        NEXUS_ERROR("SHM-V3") << "Failed to register node " << node_id;
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(callbacks_mutex_);
+    local_registered_nodes_.insert(node_id);
+    NEXUS_DEBUG("SHM-V3") << "Registered local node " << node_id << " to transport " << transport_id_;
+    return true;
+}
+
+bool SharedMemoryTransportV3::unregisterNodeFromRegistry(const std::string& node_id) {
+    if (!initialized_) return false;
+    
+    NEXUS_DEBUG("SHM-V3") << "Unregistering node " << node_id;
+    
+    // Update local set
+    {
+        std::lock_guard<std::mutex> lock(callbacks_mutex_);
+        local_registered_nodes_.erase(node_id);
+    }
+    
+    // Update registry
+    return registry_.unregisterNode(node_id);
 }
 
 bool SharedMemoryTransportV3::send(const std::string& dest_node_id, const uint8_t* data, size_t size) {
@@ -290,12 +327,23 @@ bool SharedMemoryTransportV3::send(const std::string& dest_node_id, const uint8_
         return false;
     }
 
-    if (dest_node_id == node_id_) {
-        return false;  // Don't send to self
+    // Check if destination is local (Process Loopback optimization)
+    // The higher level NodeImpl should handle this, but if it reaches here,
+    // we should validly reject or handle.
+    {
+        std::lock_guard<std::mutex> lock(callbacks_mutex_);
+        if (local_registered_nodes_.count(dest_node_id) > 0) {
+            // Loopback via SHM is inefficient and not supported in this design
+            // NodeImpl should use direct delivery
+            return false;
+        }
     }
 
     // 🔧 双队列架构：根据消息类型选择队列
     bool is_control = isControlMessage(data, size);
+    
+    NEXUS_DEBUG("SHM-V3") << "Sending to " << dest_node_id << " size=" << size 
+        << " is_control=" << is_control;
 
     // Fast path: check if already connected
     {
@@ -329,6 +377,9 @@ bool SharedMemoryTransportV3::send(const std::string& dest_node_id, const uint8_
                 if (success) {
                     target_sem = &queue->data_sem;
                     target_pending = &queue->data_pending;
+                    NEXUS_DEBUG("SHM-V3") << "Wrote " << size << " bytes to " << dest_node_id;
+                } else {
+                    NEXUS_ERROR("SHM-V3") << "Failed to write " << size << " bytes to " << dest_node_id;
                 }
             }
 
@@ -346,10 +397,11 @@ bool SharedMemoryTransportV3::send(const std::string& dest_node_id, const uint8_
                 } else {
                     uint32_t prev = target_pending->fetch_add(1, std::memory_order_release);
                     if (prev == 0) {
-                        // 🔧 全局CV：从queue指针计算remote_shm地址
-                        NodeSharedMemory* remote_shm = reinterpret_cast<NodeSharedMemory*>(
-                            reinterpret_cast<char*>(queue) - offsetof(NodeSharedMemory, queues));
+                        // 🔧 全局CV：使用保存的 shm_ptr
+                        NodeSharedMemory* remote_shm = static_cast<NodeSharedMemory*>(it->second.shm_ptr);
+                        pthread_mutex_lock(&remote_shm->header.global_mutex);
                         pthread_cond_signal(&remote_shm->header.global_cond);
+                        pthread_mutex_unlock(&remote_shm->header.global_mutex);
                     }
                 }
 
@@ -377,16 +429,16 @@ bool SharedMemoryTransportV3::send(const std::string& dest_node_id, const uint8_
     }
 
     // Slow path: establish connection first
-    NEXUS_DEBUG("SHM-V3") << "[" << node_id_ << "] Not connected to " << dest_node_id
+    NEXUS_DEBUG("SHM-V3") << "[" << transport_id_ << "] Not connected to " << dest_node_id
                           << ", attempting lazy connection...";
 
     if (!connectToNode(dest_node_id)) {
         stats_messages_dropped_++;
-        NEXUS_DEBUG("SHM-V3") << "[" << node_id_ << "] Failed to connect to " << dest_node_id;
+        NEXUS_DEBUG("SHM-V3") << "[" << transport_id_ << "] Failed to connect to " << dest_node_id;
         return false;
     }
 
-    NEXUS_DEBUG("SHM-V3") << "[" << node_id_ << "] Successfully connected to " << dest_node_id;
+    NEXUS_DEBUG("SHM-V3") << "[" << transport_id_ << "] Successfully connected to " << dest_node_id;
 
     // Retry send after connection
     {
@@ -428,8 +480,7 @@ bool SharedMemoryTransportV3::send(const std::string& dest_node_id, const uint8_
                     uint32_t prev = target_pending->fetch_add(1, std::memory_order_release);
                     if (prev == 0) {
                         // 🔧 全局CV：signal远程节点的global_cond
-                        NodeSharedMemory* remote_shm = reinterpret_cast<NodeSharedMemory*>(
-                            reinterpret_cast<char*>(queue) - offsetof(NodeSharedMemory, queues));
+                        NodeSharedMemory* remote_shm = static_cast<NodeSharedMemory*>(it->second.shm_ptr);
                         pthread_cond_signal(&remote_shm->header.global_cond);
                     }
                 }
@@ -457,29 +508,51 @@ int SharedMemoryTransportV3::broadcast(const uint8_t* data, size_t size) {
     std::vector<NodeInfo> nodes = registry_.getAllNodes();
     int sent_count = 0;
 
-    NEXUS_DEBUG("SHM-V3") << "[" << node_id_ << "] Broadcasting to " << nodes.size() << " nodes in registry";
+    NEXUS_DEBUG("SHM-V3") << "[" << transport_id_ << "] Broadcasting to " << nodes.size() << " nodes in registry";
+
+    std::unordered_set<std::string> local_nodes;
+    {
+        std::lock_guard<std::mutex> lock(callbacks_mutex_);
+        local_nodes = local_registered_nodes_;
+    }
 
     for (const auto& node : nodes) {
-        if (node.node_id == node_id_) {
-            continue;  // Skip self
+        if (local_nodes.count(node.node_id) > 0) {
+            continue;  // Skip local nodes (including self)
         }
 
-        NEXUS_DEBUG("SHM-V3") << "[" << node_id_ << "] Broadcast attempt to " << node.node_id
+        NEXUS_DEBUG("SHM-V3") << "[" << transport_id_ << "] Broadcast attempt to " << node.node_id
                               << " (active: " << node.active << ")";
 
         if (node.active && send(node.node_id, data, size)) {
             sent_count++;
-            NEXUS_DEBUG("SHM-V3") << "[" << node_id_ << "] Broadcast to " << node.node_id << " SUCCESS";
+            NEXUS_DEBUG("SHM-V3") << "[" << transport_id_ << "] Broadcast to " << node.node_id << " SUCCESS";
         } else {
-            NEXUS_DEBUG("SHM-V3") << "[" << node_id_ << "] Broadcast to " << node.node_id << " FAILED";
+            NEXUS_DEBUG("SHM-V3") << "[" << transport_id_ << "] Broadcast to " << node.node_id << " FAILED";
         }
     }
 
     return sent_count;
 }
 
-void SharedMemoryTransportV3::setReceiveCallback(ReceiveCallback callback) {
-    receive_callback_ = callback;
+void SharedMemoryTransportV3::addReceiveCallback(const std::string& node_id, ReceiveCallback callback) {
+    std::lock_guard<std::mutex> lock(callbacks_mutex_);
+    receive_callbacks_[node_id] = callback;
+}
+
+void SharedMemoryTransportV3::removeReceiveCallback(const std::string& node_id) {
+    std::lock_guard<std::mutex> lock(callbacks_mutex_);
+    receive_callbacks_.erase(node_id);
+}
+
+void SharedMemoryTransportV3::addNodeEventCallback(const std::string& node_id, NodeEventCallback callback) {
+    std::lock_guard<std::mutex> lock(callbacks_mutex_);
+    node_event_callbacks_[node_id] = callback;
+}
+
+void SharedMemoryTransportV3::removeNodeEventCallback(const std::string& node_id) {
+    std::lock_guard<std::mutex> lock(callbacks_mutex_);
+    node_event_callbacks_.erase(node_id);
 }
 
 void SharedMemoryTransportV3::startReceiving() {
@@ -490,15 +563,42 @@ void SharedMemoryTransportV3::startReceiving() {
     receiving_.store(true);
 
     // 🔧 立即更新心跳，防止在心跳线程启动前被误判超时
-    registry_.updateHeartbeat(node_id_);
-
+    // Note: We register heartbeat for one primary node or the transport?
+    // Actually registry expects NODE IDs for heartbeat.
+    // The transport manages heartbeat for all local nodes?
+    // Or does NodeImpl update heartbeat?
+    // In shared transport, the Transport updates the Single SHM file header.
+    // Registry checks file timestamp or header timestamp.
+    // The timestamp is PER SHM FILE.
+    // So one updates is enough for all nodes in this process.
+    // registry_.updateHeartbeat(transport_id_) ??
+    // No, registry expects node_id.
+    // But Registry implementation maps NodeID -> SHM Name.
+    // The heartbeat is on SHM Name.
+    // So we pick *any* node id?
+    // Or we update registry with transport_id?
+    // Let's assume updating any registered node works, or we update 'transport_id' if we registered it?
+    // We register nodes, not transport ID in registry usually.
+    // But 'registerNodeToRegistry' registers (node_id -> my_shm_name).
+    // The heartbeater needs to update timestamp in 'my_shm_'.
+    // The Registry scanner checks 'my_shm_' timestamp.
+    // So calling updateHeartbeat with *any* ID is fine as long as it touches the file/entry.
+    // However, `registry_.updateHeartbeat(id)` might just touch the file.
+    
+    // We will use transport_id_ for logging context, but registry update is tricky if we don't have a specific node ID here.
+    // But startReceiving is called once. at that time we might have 0 nodes.
+    // So we can skip registry update here or use transport_id if registry supports it.
+    // Let's comment it out or use transport_id_ if it was registered? 
+    // Actually, we don't register transport_id_ as a node.
+    // We'll rely on heartbeatLoop to update the shared memory header timestamp.
+    
     // Start receive thread
     receive_thread_ = std::thread([this]() { receiveLoop(); });
 
     // Start heartbeat thread
     heartbeat_thread_ = std::thread([this]() { heartbeatLoop(); });
 
-    NEXUS_DEBUG("SHM-V3") << "Started receiving threads for " << node_id_;
+    NEXUS_DEBUG("SHM-V3") << "Started receiving threads for " << transport_id_;
 }
 
 void SharedMemoryTransportV3::stopReceiving() {
@@ -506,7 +606,7 @@ void SharedMemoryTransportV3::stopReceiving() {
         return;
     }
 
-    NEXUS_DEBUG("SHM-V3") << "Stopping receiving threads for " << node_id_;
+    NEXUS_DEBUG("SHM-V3") << "Stopping receiving threads for " << transport_id_;
 
     // 🔧 使用 release 语义确保线程能看到变化
     receiving_.store(false, std::memory_order_release);
@@ -550,25 +650,34 @@ void SharedMemoryTransportV3::stopReceiving() {
 
     // 🔧 CRITICAL: 线程已退出，现在可以安全清空 callback
     // 必须在线程 join 之后，确保没有线程还在访问
-    receive_callback_ = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(callbacks_mutex_);
+        receive_callbacks_.clear();
+        node_event_callbacks_.clear();
+    }
 
-    NEXUS_DEBUG("SHM-V3") << "Stopped receiving threads for " << node_id_;
+    NEXUS_DEBUG("SHM-V3") << "Stopped receiving threads for " << transport_id_;
 }
 
 std::vector<std::string> SharedMemoryTransportV3::getLocalNodes() const {
-    std::vector<std::string> node_ids;
+    std::lock_guard<std::mutex> lock(callbacks_mutex_);
+    return std::vector<std::string>(local_registered_nodes_.begin(), local_registered_nodes_.end());
+}
 
+std::vector<std::string> SharedMemoryTransportV3::getAllRegisteredNodes() const {
     if (!initialized_) {
-        return node_ids;
+        return {};
     }
-
-    std::vector<NodeInfo> nodes = registry_.getAllNodes();
-    for (const auto& node : nodes) {
-        if (node.active) {
-            node_ids.push_back(node.node_id);
-        }
+    
+    // Query all nodes from the shared memory registry
+    auto all_nodes = registry_.getAllNodes();
+    std::vector<std::string> node_ids;
+    node_ids.reserve(all_nodes.size());
+    
+    for (const auto& node_info : all_nodes) {
+        node_ids.push_back(node_info.node_id);
     }
-
+    
     return node_ids;
 }
 
@@ -577,7 +686,8 @@ bool SharedMemoryTransportV3::isLocalNode(const std::string& node_id) const {
         return false;
     }
 
-    return registry_.nodeExists(node_id);
+    std::lock_guard<std::mutex> lock(callbacks_mutex_);
+    return local_registered_nodes_.find(node_id) != local_registered_nodes_.end();
 }
 
 int SharedMemoryTransportV3::getConnectionCount() const {
@@ -599,8 +709,15 @@ void SharedMemoryTransportV3::warmupConnections() {
     std::vector<NodeInfo> nodes = registry_.getAllNodes();
     int connected = 0;
 
+    // Get local nodes snapshot to skip loopback
+    std::unordered_set<std::string> local_nodes;
+    {
+        std::lock_guard<std::mutex> lock(callbacks_mutex_);
+        local_nodes = local_registered_nodes_;
+    }
+
     for (const auto& node : nodes) {
-        if (node.node_id != node_id_ && node.active) {
+        if (local_nodes.count(node.node_id) == 0 && node.active) {
             if (connectToNode(node.node_id)) {
                 connected++;
             }
@@ -685,8 +802,9 @@ bool SharedMemoryTransportV3::cleanupOrphanedMemory() {
     while ((entry = readdir(dir)) != nullptr) {
         std::string name = entry->d_name;
 
-        // 只处理librpc_node_*的共享内存
-        if (name.find("librpc_node_") != 0) {
+        // 只处理librpc_node_*和librpc_process_*的共享内存
+        // 兼容旧版(node_)和新版(process_)命名规范
+        if (name.find("librpc_node_") != 0 && name.find("librpc_process_") != 0) {
             continue;
         }
 
@@ -701,6 +819,7 @@ bool SharedMemoryTransportV3::cleanupOrphanedMemory() {
         struct stat st;
         if (fstat(fd, &st) != 0) {
             close(fd);
+            NEXUS_WARN("SHM-V3") << "Failed to fstat: " << name;
             continue;
         }
 
@@ -833,6 +952,7 @@ bool SharedMemoryTransportV3::createMySharedMemory() {
     // Initialize header
     my_shm_->header.magic.store(MAGIC, std::memory_order_relaxed);
     my_shm_->header.version.store(VERSION, std::memory_order_relaxed);
+
     my_shm_->header.num_queues.store(0, std::memory_order_relaxed);
     // Safe cast: max_inbound_queues is validated in initialize()
     my_shm_->header.max_queues.store(static_cast<uint32_t>(config_.max_inbound_queues), std::memory_order_relaxed);
@@ -1022,7 +1142,7 @@ bool SharedMemoryTransportV3::connectToNode(const std::string& target_node_id) {
     }
 
     // Find or create queue for me in target node's memory
-    conn.my_queue = findOrCreateQueue(remote_shm, node_id_);
+    conn.my_queue = findOrCreateQueue(remote_shm, transport_id_);
     if (!conn.my_queue) {
         NEXUS_ERROR("SHM-V3") << "Failed to create queue in remote node";
 
@@ -1082,9 +1202,11 @@ void SharedMemoryTransportV3::disconnectFromNode(const std::string& target_node_
 SharedMemoryTransportV3::InboundQueue* SharedMemoryTransportV3::findOrCreateQueue(NodeSharedMemory* remote_shm,
                                                                                   const std::string& sender_id) {
     // First, try to find existing queue
-    // 🔧 Use seq_cst to see all queues including just-created ones
+    // 🔧 Scan ALL queues to be safe against non-contiguous slots
     uint32_t num_queues = remote_shm->header.num_queues.load(std::memory_order_seq_cst);
-    for (uint32_t i = 0; i < num_queues && i < MAX_INBOUND_QUEUES; ++i) {
+    
+    // Iterate up to MAX to ensure we catch any existing queue regardless of num_queues
+    for (uint32_t i = 0; i < MAX_INBOUND_QUEUES; ++i) {
         InboundQueue& q = remote_shm->queues[i];
         // 🔧 Use seq_cst to ensure we see complete queue initialization
         if (q.flags.load(std::memory_order_seq_cst) & 0x1) {
@@ -1176,7 +1298,7 @@ void SharedMemoryTransportV3::receiveLoop() {
 
 // Condition Variable模式的接收循环（优化版）
 void SharedMemoryTransportV3::receiveLoop_CV() {
-    NEXUS_DEBUG("SHM-V3") << "Receive loop started for " << node_id_ << " (Condition Variable mode - optimized)";
+    NEXUS_DEBUG("SHM-V3") << "Receive loop started for " << transport_id_ << " (Condition Variable mode - optimized)";
 
     static constexpr size_t MESSAGE_SIZE = 2048;
     uint8_t buffer[MESSAGE_SIZE];
@@ -1190,7 +1312,8 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
     int consecutive_empty_loops = 0;
 
     while (receiving_.load()) {
-        if (!my_shm_) {
+        try {
+            if (!my_shm_) {
             // 🔧 Wait for shared memory - use longer sleep since this is rare
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
@@ -1238,9 +1361,9 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
         }
 
         if (active_queues.empty()) {
-            // 🔧 No queues available - use condition variable to wait efficiently
-            // This avoids busy-wait and reduces CPU to 0% when idle
             has_active_queues_.store(false, std::memory_order_release);
+            // DEBUG: Log waiting for queues
+            // NEXUS_DEBUG("SHM-V3") << "[" << transport_id_ << "] No active queues, waiting...";
 
             std::unique_lock<std::mutex> lock(queue_wait_mutex_);
             queue_wait_cv_.wait_for(lock, std::chrono::milliseconds(SHM_TIMEOUT_IDLE_MS),
@@ -1250,6 +1373,9 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
 
         // Mark that we have active queues
         has_active_queues_.store(true, std::memory_order_relaxed);
+        
+        // DEBUG: Trace active queues
+        // if (queue_refresh_counter % 100 == 0) NEXUS_DEBUG("SHM-V3") << "Processing " << active_queues.size() << " queues";
 
         // 🔧 双队列架构：优先处理控制队列，确保服务发现不受数据流量影响
         bool has_messages = false;
@@ -1283,14 +1409,28 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
                 processed++;
                 has_messages = true;
 
-                // 🔧 检查 callback 是否有效（可能在析构时被清空）
-                auto callback = receive_callback_;
-                if (callback) {
-                    NEXUS_INFO("SHM-V3")
-                        << "[CTRL] Received control message from " << from_node << " (" << msg_size << " bytes)";
-                    callback(buffer, msg_size, from_node);
-                } else {
-                    NEXUS_WARN("SHM-V3") << "Callback is null!";
+                // 🔧 BROADCAST to all local nodes sharing this transport
+                {
+                    std::vector<std::pair<std::string, ReceiveCallback>> valid_callbacks;
+                    {
+                        std::lock_guard<std::mutex> lock(callbacks_mutex_);
+                        valid_callbacks.reserve(receive_callbacks_.size());
+                        for (const auto& pair : receive_callbacks_) {
+                            if (pair.second) {
+                                valid_callbacks.push_back(pair);
+                            }
+                        }
+                    }
+
+                    if (valid_callbacks.empty()) {
+                        NEXUS_WARN("SHM-V3") << "No receive callbacks registered! Message dropped.";
+                    } else {
+                        for (const auto& pair : valid_callbacks) {
+                             NEXUS_INFO("SHM-V3")
+                                << "[CTRL] Disputching control message from " << from_node << " to local node " << pair.first;
+                            pair.second(buffer, msg_size, from_node);
+                        }
+                    }
                 }
             }
 
@@ -1310,6 +1450,7 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
             // 🔧 Use acquire to ensure we see all queue fields
             uint32_t flags = q->flags.load(std::memory_order_acquire);
             if ((flags & 0x3) != 0x3) {
+                NEXUS_WARN("SHM-V3") << "Queue flags check FAILED, skipping";
                 continue;
             }
 
@@ -1328,11 +1469,25 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
 
                 processed++;
                 has_messages = true;
+                
+                NEXUS_DEBUG("SHM-V3") << "Read message size " << msg_size << " from " << from_node;
 
-                // 🔧 检查 callback 是否有效（可能在析构时被清空）
-                auto callback = receive_callback_;
-                if (callback) {
-                    callback(buffer, msg_size, from_node);
+                // 🔧 BROADCAST to all local nodes sharing this transport
+                {
+                    std::vector<std::pair<std::string, ReceiveCallback>> valid_callbacks;
+                    {
+                        std::lock_guard<std::mutex> lock(callbacks_mutex_);
+                        valid_callbacks.reserve(receive_callbacks_.size());
+                        for (const auto& pair : receive_callbacks_) {
+                            if (pair.second) {
+                                valid_callbacks.push_back(pair);
+                            }
+                        }
+                    }
+
+                    for (const auto& pair : valid_callbacks) {
+                        pair.second(buffer, msg_size, from_node);
+                    }
                 }
             }
 
@@ -1380,14 +1535,21 @@ void SharedMemoryTransportV3::receiveLoop_CV() {
             // 🔧 有消息时重置计数器，保持短超时以降低延迟
             consecutive_empty_loops = 0;
         }
+        } catch (const std::exception& e) {
+             NEXUS_ERROR("SHM-V3") << "Exception in receive loop: " << e.what();
+             std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Prevent tight loop on error
+        } catch (...) {
+             NEXUS_ERROR("SHM-V3") << "Unknown exception in receive loop";
+             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
     }
 
-    NEXUS_DEBUG("SHM-V3") << "Receive loop stopped for " << node_id_ << " (CV mode)";
+    NEXUS_DEBUG("SHM-V3") << "Receive loop stopped for " << transport_id_ << " (CV mode)";
 }
 
 // 🔧 Semaphore模式的接收循环（优化版：真正利用sem_timedwait阻塞等待）
 void SharedMemoryTransportV3::receiveLoop_Semaphore() {
-    NEXUS_DEBUG("SHM-V3") << "Receive loop started for " << node_id_ << " (Semaphore mode - optimized)";
+    NEXUS_DEBUG("SHM-V3") << "Receive loop started for " << transport_id_ << " (Semaphore mode - optimized)";
 
     static constexpr size_t MESSAGE_SIZE = 2048;
     uint8_t buffer[MESSAGE_SIZE];
@@ -1464,11 +1626,23 @@ void SharedMemoryTransportV3::receiveLoop_Semaphore() {
                 has_messages = true;
                 processed++;
 
-                // 🔧 检查 callback 是否有效（可能在析构时被清空）
-                auto callback = receive_callback_;
-                if (callback) {
-                    NEXUS_DEBUG("SHM-V3") << "[CTRL] Received control message from " << from_node;
-                    callback(buffer, msg_size, from_node);
+                // 🔧 BROADCAST to all local nodes sharing this transport
+                {
+                    std::vector<std::pair<std::string, ReceiveCallback>> valid_callbacks;
+                    {
+                        std::lock_guard<std::mutex> lock(callbacks_mutex_);
+                        valid_callbacks.reserve(receive_callbacks_.size());
+                        for (const auto& pair : receive_callbacks_) {
+                            if (pair.second) {
+                                valid_callbacks.push_back(pair);
+                            }
+                        }
+                    }
+
+                    for (const auto& pair : valid_callbacks) {
+                        NEXUS_DEBUG("SHM-V3") << "[CTRL] Disputching control message from " << from_node << " to local node " << pair.first;
+                        pair.second(buffer, msg_size, from_node);
+                    }
                 }
             }
 
@@ -1502,10 +1676,22 @@ void SharedMemoryTransportV3::receiveLoop_Semaphore() {
                 has_messages = true;
                 processed++;
 
-                // 🔧 检查 callback 是否有效（可能在析构时被清空）
-                auto callback = receive_callback_;
-                if (callback) {
-                    callback(buffer, msg_size, from_node);
+                // 🔧 BROADCAST to all local nodes sharing this transport
+                {
+                    std::vector<std::pair<std::string, ReceiveCallback>> valid_callbacks;
+                    {
+                        std::lock_guard<std::mutex> lock(callbacks_mutex_);
+                        valid_callbacks.reserve(receive_callbacks_.size());
+                        for (const auto& pair : receive_callbacks_) {
+                            if (pair.second) {
+                                valid_callbacks.push_back(pair);
+                            }
+                        }
+                    }
+
+                    for (const auto& pair : valid_callbacks) {
+                        pair.second(buffer, msg_size, from_node);
+                    }
                 }
             }
 
@@ -1559,22 +1745,26 @@ void SharedMemoryTransportV3::receiveLoop_Semaphore() {
         }
     }
 
-    NEXUS_DEBUG("SHM-V3") << "Receive loop stopped for " << node_id_ << " (Semaphore mode)";
+    NEXUS_DEBUG("SHM-V3") << "Receive loop stopped for " << transport_id_ << " (Semaphore mode)";
 }
 
 void SharedMemoryTransportV3::heartbeatLoop() {
-    NEXUS_DEBUG("SHM-V3") << "Heartbeat loop started for " << node_id_;
+    NEXUS_DEBUG("SHM-V3") << "Heartbeat loop started for " << transport_id_;
 
     int heartbeat_count = 0;
     while (receiving_.load()) {
-        // Update my heartbeat in registry
-        bool updated = registry_.updateHeartbeat(node_id_);
+        // Update my heartbeat in registry for ALL local nodes
+        {
+            std::lock_guard<std::mutex> lock(callbacks_mutex_);
+            for (const auto& nid : local_registered_nodes_) {
+                registry_.updateHeartbeat(nid);
+            }
+        }
         heartbeat_count++;
 
         // 🔧 每10次心跳打印一次日志，确保heartbeat loop没有卡住
         if (heartbeat_count % 10 == 0) {
-            NEXUS_DEBUG("SHM-V3") << "Heartbeat #" << heartbeat_count << " for " << node_id_ << " (updated: " << updated
-                                  << ")";
+            NEXUS_DEBUG("SHM-V3") << "Heartbeat #" << heartbeat_count << " for transport " << transport_id_;
         }
 
         // Update my heartbeat in my shared memory
@@ -1593,12 +1783,19 @@ void SharedMemoryTransportV3::heartbeatLoop() {
             auto all_nodes = registry_.getAllNodes();
             std::vector<std::string> new_nodes;
 
+            // Get local nodes snapshot
+            std::unordered_set<std::string> local_nodes;
+            {
+                std::lock_guard<std::mutex> lock(callbacks_mutex_);
+                local_nodes = local_registered_nodes_;
+            }
+
             // Find new nodes (check outside of lock to avoid deadlock)
             {
                 std::lock_guard<std::mutex> lock(connections_mutex_);
                 for (const auto& node : all_nodes) {
-                    // Skip self
-                    if (node.node_id == node_id_) {
+                    // Skip local nodes
+                    if (local_nodes.count(node.node_id) > 0) {
                         continue;
                     }
 
@@ -1615,13 +1812,13 @@ void SharedMemoryTransportV3::heartbeatLoop() {
 
             // Connect to new nodes (outside of lock)
             for (const auto& new_node_id : new_nodes) {
-                NEXUS_DEBUG("SHM-V3") << "[" << node_id_ << "] Discovered new node in registry: " << new_node_id
+                NEXUS_DEBUG("SHM-V3") << "[" << transport_id_ << "] Discovered new node in registry: " << new_node_id
                                       << " - establishing connection";
 
                 bool connected = connectToNode(new_node_id);
 
                 if (connected) {
-                    NEXUS_DEBUG("SHM-V3") << "[" << node_id_ << "] Successfully connected to new node: " << new_node_id;
+                    NEXUS_DEBUG("SHM-V3") << "[" << transport_id_ << "] Successfully connected to new node: " << new_node_id;
                 }
             }
         }
@@ -1631,7 +1828,7 @@ void SharedMemoryTransportV3::heartbeatLoop() {
         // 🔧 CRITICAL FIX: Reconcile active connections with registry
         // We must check if any connected nodes are missing from the registry,
         // regardless of who cleaned them up (us or another process).
-        if (node_impl_) {
+        {
             auto current_nodes = registry_.getAllNodes();
             std::set<std::string> registry_node_ids;
             for (const auto& node : current_nodes) {
@@ -1647,10 +1844,15 @@ void SharedMemoryTransportV3::heartbeatLoop() {
                     }
                 }
             }
-                // Node was removed - trigger NODE_LEFT event
-            for (const auto& nid : dead_nodes) {
-                NEXUS_INFO("SHM-V3") << "Node " << nid << " missing from registry, triggering cleanup";
-                node_impl_->handleNodeEvent(nid, false);
+
+            if (!dead_nodes.empty()) {
+                std::lock_guard<std::mutex> cb_lock(callbacks_mutex_);
+                for (const auto& nid : dead_nodes) {
+                    NEXUS_INFO("SHM-V3") << "Node " << nid << " missing from registry, triggering cleanup";
+                    for (const auto& kv : node_event_callbacks_) {
+                        if (kv.second) kv.second(nid, false);
+                    }
+                }
             }
         }
 
@@ -1660,8 +1862,9 @@ void SharedMemoryTransportV3::heartbeatLoop() {
         std::this_thread::sleep_for(std::chrono::milliseconds(HEARTBEAT_INTERVAL_MS));
     }
 
-    NEXUS_DEBUG("SHM-V3") << "Heartbeat loop stopped for " << node_id_;
+    NEXUS_DEBUG("SHM-V3") << "Heartbeat loop stopped for transport " << transport_id_;
 }
+
 
 void SharedMemoryTransportV3::cleanupStaleQueues() {
     if (!my_shm_) {
@@ -1683,10 +1886,19 @@ void SharedMemoryTransportV3::cleanupStaleQueues() {
     // TODO: Implement safer queue recycling with proper synchronization
 }
 
+std::string SharedMemoryTransportV3::getRemoteShmName(const std::string& node_id) {
+    if (!initialized_) return "";
+    Nexus::rpc::NodeInfo info;
+    if (registry_.findNode(node_id, info)) {
+        return info.shm_name;
+    }
+    return "";
+}
+
 std::string SharedMemoryTransportV3::generateShmName() {
     std::ostringstream oss;
-    oss << "/librpc_node_" << getpid() << "_" << std::hex << std::setfill('0') << std::setw(8)
-        << (std::hash<std::string>{}(node_id_)&0xFFFFFFFF);
+    oss << "/librpc_process_" << getpid() << "_" << std::hex << std::setfill('0') << std::setw(8)
+        << (std::hash<std::string>{}(transport_id_)&0xFFFFFFFF);
     return oss.str();
 }
 

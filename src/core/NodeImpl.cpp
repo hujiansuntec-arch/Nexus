@@ -21,6 +21,9 @@ namespace rpc {
 // Static member definitions for C++14 compatibility
 constexpr size_t NodeImpl::NUM_PROCESSING_THREADS;
 
+// Static member definitions for Shared Transport
+std::weak_ptr<SharedMemoryTransportV3> NodeImpl::shared_transport_s;
+std::mutex NodeImpl::shared_transport_mutex_s;
 
 // Port range constants for node discovery
 static constexpr uint16_t PORT_BASE = 47200;
@@ -59,6 +62,13 @@ NodeImpl::NodeImpl(const std::string& node_id, bool use_udp, [[maybe_unused]] ui
 
 NodeImpl::~NodeImpl() {
     running_ = false;
+
+    // Detach from shared transport callbacks immediately
+    if (shm_transport_v3_) {
+        shm_transport_v3_->removeReceiveCallback(node_id_);
+        shm_transport_v3_->removeNodeEventCallback(node_id_);
+        shm_transport_v3_->unregisterNodeFromRegistry(node_id_);
+    }
 
     // 🔧 CRITICAL: 先 unregister，广播 NODE_LEAVE
     // 这样其他节点可以在本节点完全退出前收到通知
@@ -124,22 +134,55 @@ void NodeImpl::initialize(uint16_t udp_port) {
 
     // Initialize lock-free shared memory transport
     if (transport_mode_ == TransportMode::AUTO || transport_mode_ == TransportMode::LOCK_FREE_SHM) {
-        shm_transport_v3_ = std::make_unique<SharedMemoryTransportV3>();
-        if (!shm_transport_v3_->initialize(node_id_)) {
-            NEXUS_LOG_ERROR("IMPL", "Lock-free shared memory initialization failed");
-            shm_transport_v3_.reset();
-        } else {
-            NEXUS_LOG_INFO("IMPL", "Using lock-free shared memory transport (V3 - Dynamic)");
+        // 🔧 Process-Level Shared Transport Logic
+        bool is_new_transport = false;
+        {
+            std::lock_guard<std::mutex> lock(shared_transport_mutex_s);
+            shm_transport_v3_ = shared_transport_s.lock();
+            if (!shm_transport_v3_) {
+                shm_transport_v3_ = std::make_shared<SharedMemoryTransportV3>();
+                shared_transport_s = shm_transport_v3_;
+                is_new_transport = true;
+                
+                // Construct Transport ID from PID (e.g. process_12345)
+                std::string transport_id = "process_" + std::to_string(getpid());
+                
+                if (!shm_transport_v3_->initialize(transport_id)) {
+                    NEXUS_LOG_ERROR("IMPL", "Shared transport initialization failed");
+                    shm_transport_v3_.reset();
+                    // Don't reset shared_transport_s here as weak_ptr automatically expires if shared_ptr dies,
+                    // but since we assigned it, we should careful. If logic fails, shm_transport_v3_ dies, weak ptr becomes expired.
+                }
+            }
+        }
 
-            // Set NodeImpl reference for heartbeat timeout notifications
-            shm_transport_v3_->setNodeImpl(this);
+        if (shm_transport_v3_ && shm_transport_v3_->isInitialized()) {
+            NEXUS_LOG_INFO("IMPL", "Attached to shared transport (V3 - Shared)");
 
-            // Set receive callback - parse MessagePacket format
-            shm_transport_v3_->setReceiveCallback(
-                [this](const uint8_t* data, size_t size, const std::string& from) {
-                    processPacket(data, size, from);
-                });
-            shm_transport_v3_->startReceiving();
+            // Register this node to transport registry
+            if (!shm_transport_v3_->registerNodeToRegistry(node_id_)) {
+                 NEXUS_LOG_ERROR("IMPL", "Failed to register node to shared transport");
+                 shm_transport_v3_.reset();
+            } else {
+                // Add callbacks
+                shm_transport_v3_->addReceiveCallback(node_id_,
+                    [this](const uint8_t* data, size_t size, const std::string& from) {
+                        processPacket(data, size, from);
+                    });
+                    
+                shm_transport_v3_->addNodeEventCallback(node_id_,
+                    [this](const std::string& from, bool joined) {
+                        handleNodeEvent(from, joined);
+                    });
+
+                shm_transport_v3_->startReceiving();
+
+                // Query existing services from other nodes
+                queryRemoteServices();
+
+                // Broadcast NODE_JOIN event to other processes
+                broadcastNodeEvent(true);
+            }
 
             // Shared memory: No need for QUERY_SUBSCRIPTIONS
             // Nodes are automatically discovered via SharedMemoryRegistry
@@ -149,7 +192,7 @@ void NodeImpl::initialize(uint16_t udp_port) {
             // 🔧 CRITICAL: Proactively connect to all existing nodes in registry
             // This solves the race condition where concurrent node startups miss each other
             // because registry writes happen out of order with NODE_JOIN broadcasts
-            auto existing_nodes = shm_transport_v3_->getLocalNodes();
+            auto existing_nodes = shm_transport_v3_->getAllRegisteredNodes();
             for (const auto& node_id : existing_nodes) {
                 if (node_id != node_id_) {
                     NEXUS_DEBUG("IMPL") << "Proactively connecting to existing node: " << node_id;
@@ -352,20 +395,41 @@ Node::Error NodeImpl::subscribe(const Property& msg_group, const std::vector<Pro
     sub_info.callback = callback;
 
     // Auto-register services (service discovery)
+    // Optimization: Check if any other local node is already registered for this group/topic
+    // If so, rely on process-wide broadcast and DONT register externally. 
+    // This prevents duplicate messages when multiple local nodes subscribe to same topic.
+    auto local_nodes = getAllNodes();
+    std::unordered_set<std::string> local_ids;
+    for (const auto& node : local_nodes) {
+        if (node) local_ids.insert(node->getNodeId());
+    }
+
     for (const auto& topic : topics) {
         if (!topic.empty()) {
             // Register for shared memory transport (if available)
             if (shm_transport_v3_ && shm_transport_v3_->isInitialized()) {
-                ServiceDescriptor svc;
-                svc.node_id = node_id_;
-                svc.group = msg_group;
-                svc.topic = topic;
-                svc.type = ServiceType::NORMAL_MESSAGE;
-                svc.channel_name = "";  // Not a large data channel
-                svc.transport = TransportType::SHARED_MEMORY;
-                svc.udp_address = "";
+                // Check if already registered by another local node
+                bool already_registered = false;
+                auto existing_services = Nexus::rpc::GlobalRegistry::instance().findServices(msg_group);
+                for (const auto& s : existing_services) {
+                    if (s.topic == topic && s.node_id != node_id_ && local_ids.count(s.node_id) > 0) {
+                        already_registered = true;
+                        break;
+                    }
+                }
 
-                registerService(svc);
+                if (!already_registered) {
+                    ServiceDescriptor svc;
+                    svc.node_id = node_id_;
+                    svc.group = msg_group;
+                    svc.topic = topic;
+                    svc.type = ServiceType::NORMAL_MESSAGE;
+                    svc.channel_name = "";  // Not a large data channel
+                    svc.transport = TransportType::SHARED_MEMORY;
+                    svc.udp_address = "";
+
+                    registerService(svc);
+                }
             }
 
             // Register for UDP transport (if enabled)
@@ -444,6 +508,42 @@ Node::Error NodeImpl::unsubscribe(const Property& msg_group, const std::vector<P
             svc.udp_address = "";
 
             unregisterService(svc);
+
+            // Promotion logic: check if any other local node needs this topic
+            // 1. Check if anyone else is already covering it
+            bool covered = false;
+            auto local_nodes = getAllNodes();
+            std::unordered_set<std::string> local_ids;
+            for (const auto& node : local_nodes) {
+                if (node) local_ids.insert(node->getNodeId());
+            }
+            
+            auto existing = Nexus::rpc::GlobalRegistry::instance().findServices(msg_group);
+            for (const auto& s : existing) {
+                if (s.topic == topic && local_ids.count(s.node_id) > 0) {
+                     covered = true;
+                     break;
+                }
+            }
+
+            if (!covered) {
+                // 2. Find a successor
+                for (const auto& node : local_nodes) {
+                    if (node && node->getNodeId() != node_id_ && node->isSubscribed(msg_group, topic)) {
+                        // Promote this node
+                        ServiceDescriptor new_svc = svc;
+                        new_svc.node_id = node->getNodeId();
+                        if (node->getUdpPort() > 0) {
+                             new_svc.udp_address = "0.0.0.0:" + std::to_string(node->getUdpPort());
+                        } else {
+                             new_svc.udp_address = "";
+                        }
+                        
+                        node->registerService(new_svc);
+                        break; // Promoted one, that's enough
+                    }
+                }
+            }
         }
 
         if (use_udp_ && udp_transport_ && udp_transport_->isInitialized()) {
@@ -618,9 +718,9 @@ void NodeImpl::deliverInterProcess(const std::vector<uint8_t>& packet, const std
     // Build a set of shared memory nodes (local inter-process nodes)
     std::set<std::string> shm_node_ids;
     if (shm_transport_v3_ && shm_transport_v3_->isInitialized()) {
-        // Lock-free transport: query active nodes
-        auto shm_nodes = shm_transport_v3_->getLocalNodes();
-        shm_node_ids.insert(shm_nodes.begin(), shm_nodes.end());
+        // Query ALL nodes from SharedMemoryRegistry (across all processes)
+        auto all_nodes = shm_transport_v3_->getAllRegisteredNodes();
+        shm_node_ids.insert(all_nodes.begin(), all_nodes.end());
     }
 
     // ✅ Optimization 3: Reserve capacity to avoid reallocation
@@ -686,6 +786,9 @@ void NodeImpl::deliverInterProcess(const std::vector<uint8_t>& packet, const std
     }
 
     // ✅ Optimized: Point-to-point send to each subscriber
+    NEXUS_DEBUG("IMPL") << "Delivering to " << shm_subscribers.size() << " SHM + " 
+                        << udp_subscribers.size() << " UDP subscribers";
+    
     // 1. Send via shared memory
     if (shm_transport_v3_ && shm_transport_v3_->isInitialized()) {
         for (const auto& subscriber_id : shm_subscribers) {
@@ -1686,7 +1789,7 @@ void NodeImpl::processPacket(const uint8_t* data, size_t size, [[maybe_unused]] 
     }
 
     std::string source_node(packet->node_id);
-    NEXUS_INFO("IMPL") << "Received message type " << (int)packet->msg_type << " from " << source_node;
+    // NEXUS_DEBUG("IMPL") << "Received message type " << (int)packet->msg_type << " from " << source_node;
 
     // Skip our own messages (critical: avoid self-reception)
     if (source_node == node_id_) {

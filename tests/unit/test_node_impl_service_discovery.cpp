@@ -29,14 +29,15 @@ TEST(NodeImplServiceDiscoveryTest, ServiceQueryAll) {
 
     // 2. Create a standalone transport to act as sender
     SharedMemoryTransportV3 sender_transport;
-    ASSERT_TRUE(sender_transport.initialize("sender_node"));
+    ASSERT_TRUE(sender_transport.initialize("proc_sender_node"));
+    ASSERT_TRUE(sender_transport.registerNodeToRegistry("sender_node"));
 
     // Setup callback to capture response
     std::atomic<bool> received_response{false};
     std::string received_group;
     std::string received_topic;
 
-    sender_transport.setReceiveCallback([&](const uint8_t* data, size_t size, const std::string& from) {
+    sender_transport.addReceiveCallback("sender_node", [&](const uint8_t* data, size_t size, const std::string& from) {
         if (size < sizeof(MessagePacket)) return;
         const MessagePacket* packet = reinterpret_cast<const MessagePacket*>(data);
         

@@ -40,6 +40,9 @@ TEST(TransportCoverage, LocalNodes) {
     SharedMemoryTransportV3::Config config;
     transport.initialize("local_check_node", config);
     
+    // Explicitly register the node to correct the assumption that initialize() does it
+    transport.registerNodeToRegistry("local_check_node");
+
     ASSERT_TRUE(transport.isLocalNode("local_check_node"));
     ASSERT_FALSE(transport.isLocalNode("non_existent"));
     

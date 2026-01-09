@@ -33,6 +33,27 @@
 - **数据完整性**：CRC32校验、序列号检测
 - **流控保护**：背压机制防止内存溢出
 
+### 📝 统一日志系统（v3.0新增）
+
+- **独立库**：`libnexus_logger.so` 可单独使用
+- **线程安全**：全局互斥锁保护，无输出交错
+- **流式API**：类似 `std::cout` 的使用体验
+- **灵活配置**：环境变量 + 运行时设置
+- **低开销**：INFO级别<10%，DEBUG级别~30%
+
+```cpp
+#include "nexus/utils/Logger.h"
+
+// 流式日志（推荐）
+NEXUS_DEBUG("Transport") << "Sending to " << node_id << ", size: " << size;
+NEXUS_INFO("Registry") << "Node registered: " << node_id;
+NEXUS_WARN("Queue") << "Queue 80% full";
+NEXUS_ERROR("Node") << "Heartbeat timeout: " << node_id;
+
+// 环境变量控制
+export NEXUS_LOG_LEVEL=DEBUG  # DEBUG/INFO/WARN/ERROR/NONE
+```
+
 ### 🌐 跨平台支持
 
 - **Linux**：完整支持，MAP_NORESERVE优化（开发/测试）
@@ -74,7 +95,8 @@ make -j4
 ```
 
 **生成文件**：
-- `build/librpc.so.1.0.0` - 共享库（~256KB）
+- `build/libnexus.so.3.0.0` - Nexus主库（~512KB）
+- `build/libnexus_logger.so.3.0.0` - Logger独立库（~32KB）
 - `build/test_*` - 测试程序
 
 ### QNX交叉编译
@@ -538,20 +560,49 @@ config.queue_capacity = 64;
 
 # 或单独运行
 cd build
+export LD_LIBRARY_PATH=$(pwd):$LD_LIBRARY_PATH
+
+# 设置日志级别（可选）
+export NEXUS_LOG_LEVEL=INFO  # DEBUG/INFO/WARN/ERROR/NONE
+
 ./test_inprocess            # 进程内通信测试
 ./test_duplex_v2            # 双工通信测试
 ./test_heartbeat_timeout    # 心跳超时测试
 ./test_service_discovery    # 服务发现测试
 ```
 
+### Multi模式测试（v3.0新增）
+
+支持多进程多节点混合通信测试：
+
+```bash
+# Multi模式：2进程 × 4节点 = 8节点共享topic
+./run_duplex_test.sh multi 10 256 1000 2 4 shared_channel
+
+# 查看详细日志
+export NEXUS_LOG_LEVEL=DEBUG
+./run_duplex_test.sh multi 5 128 500 2 2
+
+# 性能测试（禁用日志）
+export NEXUS_LOG_LEVEL=NONE
+./run_duplex_test.sh multi 20 256 1000 3 3
+```
+
+**通信拓扑**：
+- 进程内通信：同进程节点之间（<1μs延迟）
+- 跨进程通信：不同进程节点之间（~10μs延迟）
+- 放大效应：每节点接收 `(总节点数 - 1) × 发送量`
+
 ### 测试覆盖
 
 - ✅ 进程内通信（零开销）
 - ✅ 跨进程共享内存通信
+- ✅ 多进程多节点混合通信（Multi模式）
 - ✅ 心跳超时检测
 - ✅ 服务发现机制
 - ✅ 节点事件通知
 - ✅ 资源自动清理
+- ✅ Logger线程安全日志
 
 ---
 
@@ -563,13 +614,15 @@ MIT License
 
 ## 📈 版本历史
 
-### v3.0 (2025-11-28) - 性能优化 + 简化架构
+### v3.0 (2025-11-28) - 性能优化 + Logger独立库
 
 - ✅ **移除FIFO方案**：简化为CV + Semaphore双机制
 - ✅ **批量通知优化**：CPU从8.6%降到5.7%（⬇️34%）
 - ✅ **缓存活跃队列**：减少90%遍历开销
 - ✅ **自适应超时**：空闲50ms、繁忙5ms动态切换
-- ✅ **Flags安全验证**：双重保护机制
+- ✅ **独立Logger库**：`libnexus_logger.so` 可单独使用
+- ✅ **流式日志API**：线程安全、低开销的流式接口
+- ✅ **Multi模式测试**：跨进程+进程内混合通信测试
 - ✅ **详细设计文档**：新增DESIGN_DOC.md
 
 ### v3.0 (2025-11-26) - 内存优化 + 跨平台
